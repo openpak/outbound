@@ -4,10 +4,12 @@
 // a JSON verdict back. See:
 // https://doc.photonengine.com/realtime/v5/connection-and-authentication/authentication/custom-authentication
 //
-// PROOF-OF-CONCEPT ONLY. It accepts any "identity" value as authenticated —
-// there is no OpenPak session verification yet. Never point a Photon app's
-// Custom Authentication URL at this without adding real verification first,
-// and never forward a Nintendo/OpenPak token here (see HANDOFF.md).
+// PROOF-OF-CONCEPT ONLY. It currently accepts every request as authenticated
+// — there is no OpenPak session verification yet, and Outbound's real
+// custom-auth parameter names aren't known yet either. Never point a Photon
+// app's Custom Authentication URL at this without adding real verification
+// first. Parameter values are never logged, only their names, in case
+// Outbound resends BAAS-token-shaped data (see HANDOFF.md).
 package main
 
 import (
@@ -15,6 +17,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 )
 
 type authResponse struct {
@@ -24,10 +28,16 @@ type authResponse struct {
 	Message    string `json:"Message,omitempty"`
 }
 
-const (
-	resultOk     = 1
-	resultFailed = 2
-)
+const resultOk = 1
+
+func paramNames(form map[string][]string) string {
+	names := make([]string, 0, len(form))
+	for k := range form {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
+}
 
 func handleAuth(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -35,19 +45,17 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ponytail: identity is taken as already-stable and used verbatim as the
-	// Photon UserId. Swap for real OpenPak session-token verification before
-	// this ever sees production or non-test traffic.
-	identity := r.Form.Get("identity")
-	w.Header().Set("Content-Type", "application/json")
-	if identity == "" {
-		json.NewEncoder(w).Encode(authResponse{
-			ResultCode: resultFailed,
-			Message:    "missing identity parameter",
-		})
-		return
-	}
+	// ponytail: accept-all so the first live test just proves the Name
+	// Server -> Master Server -> Game Server flow and custom-auth wiring
+	// work at all. Add real OpenPak identity mapping and rejection once
+	// Outbound's actual parameter names are known from this endpoint's logs.
+	log.Printf("auth request, params=[%s]", paramNames(r.Form))
 
+	identity := r.Form.Get("identity")
+	if identity == "" {
+		identity = "legacy-test-user"
+	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(authResponse{
 		ResultCode: resultOk,
 		UserId:     identity,

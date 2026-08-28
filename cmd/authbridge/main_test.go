@@ -14,8 +14,8 @@ func TestHandleAuth(t *testing.T) {
 		wantResult int
 		wantUserId string
 	}{
-		{"ok", "?identity=test-user-1", resultOk, "test-user-1"},
-		{"missing identity", "", resultFailed, ""},
+		{"with identity", "?identity=test-user-1", resultOk, "test-user-1"},
+		{"no params, accept-all default", "", resultOk, "legacy-test-user"},
 	}
 
 	for _, c := range cases {
