@@ -49,13 +49,77 @@ other string value immediately after the App ID for the fields that would
 hold `AppVersion`/`FixedRegion` in Photon's `AppSettings` struct, consistent
 with those being left at their empty/default values in the project.
 
+## Retail rejection reason (confirmed)
+
+Citron's plaintext `op230` (Authenticate) failure response carries more than
+the 3-byte op/return-code header already decoded above: a GpBinaryV16 string
+value (type `0x07`, length-prefixed) directly follows it — Photon's
+`DebugMessage`. Decoded from a live capture:
+
+```
+op230_rest[29] = 07 1a "Nintendo validation failed" 00
+                 ^^ ^^                                ^^
+                 |  |                                 paramCount=0 (no further params)
+                 |  length (26)
+                 GpBinary type=String
+```
+
+**`"Nintendo validation failed"`.** This confirms the retail app's real
+custom-authentication backend does receive and evaluate Citron's replacement
+BAAS token — it's Nintendo's own account-service-side validation of that
+token that rejects it, not Photon, not DNS/UDP, not the app configuration.
+This matches the project's original assumption and is why the plan has
+always been a OpenPak-controlled Photon app + auth bridge rather than
+patching the retail flow. No crypto/decryption was needed for this — the
+`CustomAuthenticationFailed` response is sent in plaintext by design; only
+the first 3 bytes had previously been decoded.
+
+## Test-app investigation (App ID override, proof-of-concept)
+
+Two isolated Photon test apps were created to validate the proof-of-concept
+plan (see HANDOFF.md): a Fusion 2 app (`17a9e6d7-594a-443b-9f1e-931da70c3b1c`)
+and a Fusion 1 app (`74c7f0c0-7c70-4651-8bcd-420920c2dba4`), swapped in via
+the `appidmod`-generated LayeredFS mod (`cmd/appidmod`).
+
+Findings:
+
+- Outbound's client, redirected to either test app, fails identically every
+  time: an **encrypted** `op230` OperationResponse with the same body size
+  (78 bytes), regardless of Fusion 1 vs Fusion 2, custom-auth
+  enabled/disabled/anonymous, or region. `authbridge` never receives a
+  request in any of these attempts (confirmed via ngrok's own request
+  inspector, not just server-side logs) — the connection is rejected before
+  Custom Authentication is ever invoked.
+- The test apps and `authbridge` are independently confirmed fully healthy:
+  the official `photon-realtime` npm package (Exit Games' own JS SDK,
+  WSS transport) connects, authenticates, and joins the lobby against
+  `17a9e6d7-...` successfully — both anonymously and with a large
+  (~1.9KB) string-encoded custom-auth parameter that correctly invokes
+  `authbridge`.
+- A same-size (~1.4KB) **binary** `ClientAuthenticationData` payload sent via
+  that same JS SDK reproduces the same `32755 CustomAuthenticationFailed`
+  code with message `"Authentication data type not supported"` — but this
+  is not confirmed to be Outbound's actual failure reason; it may be an
+  artifact of this particular JS library's own serialization of a raw byte
+  array rather than a genuine server-side rejection of well-formed binary
+  auth data from a real compiled SDK. Flagged as a lead, not a conclusion.
+- Since Outbound's failure response is encrypted (unlike retail's
+  plaintext one), reading its actual DebugMessage would require the AES
+  session key — which is derived via Diffie-Hellman and is **not**
+  recoverable from a passive packet capture alone (that's the whole point
+  of DH: only the two parties who each hold a private exponent, never
+  transmitted, can derive it). Decrypting it would require hooking
+  Outbound's own compiled Fusion code at runtime to read the key as
+  generated, a materially more invasive step not yet attempted.
+
 ## Unknowns to resolve
 
+- Why Outbound's client fails against a healthy, correctly-configured test
+  app before Custom Authentication is invoked (see above)
 - App Version sent by the client (likely empty/default `"1.0"` based on the
   serialized `PhotonAppSettings` asset — not yet confirmed on the wire)
-- Authentication type and non-secret parameter names
-- Whether a test App ID can be supplied through a data-only mod or needs a
-  title-scoped Citron runtime override
+- Whether Outbound sends its custom-auth token as binary
+  `ClientAuthenticationData` or a string `ClientAuthenticationParams` param
 - Required successful-auth response fields beyond a stable user ID/token
 - Master/Game Server room and event behavior used by Outbound
 - Whether Photon Cloud is acceptable for proof-of-concept only and what a fully

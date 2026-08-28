@@ -1,6 +1,6 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-08-28 (App ID recovered)
+Last updated: 2026-08-28 (retail rejection reason decoded; test-app blocker open)
 
 ## Objective
 
@@ -69,6 +69,23 @@ Conclusion: DNS, UDP, Photon init and encryption work. Outbound's configured
 Nintendo Switch custom-authentication provider rejects the replacement BAAS
 token supplied by Citron. No NEX request occurs.
 
+**Rejection reason, confirmed:** the plaintext failure response carries more
+than the 3-byte op/return-code header — a GpBinaryV16 string parameter
+(Photon's `DebugMessage`) follows it, and it decodes to:
+
+```
+"Nintendo validation failed"
+```
+
+No decryption was needed — `CustomAuthenticationFailed` responses are sent
+in plaintext by design; the tracer just hadn't decoded past the first 3
+bytes before. This confirms the retail app's real custom-auth backend does
+receive and evaluate Citron's replacement token; it's Nintendo's own
+account-service-side validation that rejects it. Not fixable on our end —
+confirms the plan below (own Photon app + own auth bridge) is the right
+approach, not patching the retail flow. See
+[`docs/research.md`](docs/research.md#retail-rejection-reason-confirmed).
+
 ## Citron build and modifications
 
 Repository:
@@ -93,11 +110,18 @@ The patch adds:
 - fragment number/count/offset/total-length reporting;
 - plaintext operation code and both-endian return-code reporting;
 - extraction of only a 32-character hexadecimal App ID from a plaintext Photon
-  init message.
+  init message, falling back to a structural `init_body=<hex>` dump when
+  that strict scan misses (recovered the truncated App ID — see below);
+- a hex dump of the rest of a plaintext `op230` (Authenticate) response body,
+  which decoded the `"Nintendo validation failed"` DebugMessage above.
 
-The tracer deliberately does **not** log raw authentication payloads, parameter
-values, debug strings, BAAS tokens or encryption material. Packet fingerprints
-exist only to correlate retries.
+The tracer deliberately does **not** log raw authentication *payloads*
+(the BAAS token, the Authenticate request's encrypted body, or
+`ClientAuthenticationData`/params) or encryption/key material. It does now
+decode Photon's own plaintext protocol metadata — App IDs (documented as
+public, non-secret identifiers) and DebugMessage strings (Photon's own
+rejection reasons, not user credentials). Packet fingerprints exist to
+correlate retries independent of any of that.
 
 Incremental build command:
 
@@ -169,33 +193,70 @@ App Version is still unconfirmed on the wire; the serialized
 `PhotonAppSettings` asset shows no value in that field, suggesting Fusion's
 empty/default (`"1.0"`).
 
-## Next step: proof-of-concept
+## Proof-of-concept plan and status
 
-Move to the [proof-of-concept plan](#proof-of-concept-plan) below: stand up a
-separate test Photon application, a Go custom-authentication bridge, and a
-Citron-side App ID override so Outbound's client talks to the test app
-instead of the retail one.
-
-## Proof-of-concept plan
-
-After identifying the client configuration:
-
-1. Create a separate Photon test application. Never alter or depend on the
+1. ✅ Create a separate Photon test application. Never alter or depend on the
    retail owner's Photon dashboard/application.
-2. Build a small Go custom-authentication endpoint that maps a valid Reference
-   identity to a stable Photon user ID.
-3. Do not forward a Nintendo or Reference token to the new Photon application.
-   Use a scoped, newly issued test credential or a local-only identity during
-   the first proof.
-4. Add a title-scoped Citron runtime override, or a data-only mod, that replaces
-   Outbound's Photon App ID with the test App ID.
-5. Verify Name Server → Master Server → Game Server transitions.
-6. Test room creation, listing/discovery, joining, leaving and reconnecting with
-   two independently authenticated clients.
-7. Only after gameplay is proven, decide whether Photon Cloud is acceptable for
-   a proof of concept or whether Reference needs a fully self-hosted compatible
-   transport. A self-hosted implementation is much larger than the Go auth
-   bridge and should not be started before the client flow is demonstrated.
+   Two exist: Fusion 2 `17a9e6d7-594a-443b-9f1e-931da70c3b1c`, Fusion 1
+   `74c7f0c0-7c70-4651-8bcd-420920c2dba4` (created to rule out a
+   Fusion-version mismatch — it didn't change the outcome).
+2. ✅ Build a small Go custom-authentication endpoint (`cmd/authbridge`) that
+   maps a valid earlier identity to a stable Photon user ID. Currently
+   accept-all (proof-of-concept only, see the file's own doc comment) since
+   Outbound's real custom-auth parameter names still aren't known.
+3. ✅ No Nintendo/OpenPak token forwarded to the test apps — `authbridge`
+   only ever sees test/probe identities.
+4. ✅ App ID override via a data-only mod (`cmd/appidmod`, LayeredFS output
+   under `~/.local/share/citron/load/0100ED9024EB8000/legacy-test-app/`).
+   No Citron runtime override was needed.
+5. ❌ **Blocked here.** Outbound's client, redirected to either test app,
+   fails identically every time — an encrypted `op230` response, same 78-byte
+   body size regardless of Fusion 1/2, region, or auth setting, and
+   `authbridge` never receives a request (confirmed via ngrok's request
+   inspector). The rejection happens *before* Custom Authentication is
+   invoked. The test apps themselves are independently confirmed fully
+   healthy: the official `photon-realtime` npm package connects,
+   authenticates (including through `authbridge` with a large string
+   auth param), and joins the lobby against `17a9e6d7-...` with no issues.
+   So this is specific to something about Outbound's actual client request,
+   not the test app config. Full writeup:
+   [`docs/research.md`](docs/research.md#test-app-investigation-app-id-override-proof-of-concept).
+6. Not started — blocked by 5.
+7. Not started — blocked by 5.
+
+### Tooling from this investigation
+
+- `cmd/authbridge` — the custom-auth webhook (`go run ./cmd/authbridge`,
+  listens on `:8081`). Needs a public tunnel to be reachable from Photon
+  Cloud (ngrok used so far — `ngrok http 8081`, update the test app's
+  Custom Authentication URL to the printed `https://...ngrok-free.app/auth`
+  each time the tunnel restarts, free-tier URLs aren't stable).
+- `cmd/appidmod` — regenerates the App ID LayeredFS mod from a RomFS dump:
+  `go run ./cmd/appidmod -romfs <dumped romfs> -old <old-app-id> -new <new-app-id> -out <load dir>/romfs`.
+- `/tmp/photon-probe` (not in this repo, scratch) — a small Node.js project
+  using Exit Games' own `photon-realtime` npm package to probe the test apps
+  directly over WSS, independent of Outbound/Citron. Recreate with
+  `npm install photon-realtime` if needed again; useful for isolating
+  whether a failure is app-side or Outbound-client-side.
+
+### Next step
+
+Figure out what's different about Outbound's real `Authenticate` request
+that a real Photon SDK client doesn't do. Leads, in rough order of promise:
+
+- Whether Outbound sends its custom-auth token as binary
+  `ClientAuthenticationData` vs. a string `ClientAuthenticationParams` —
+  untested against a real compiled SDK (only tested via `photon-realtime`'s
+  own possibly-imperfect binary serialization, which isn't conclusive).
+- The client's `AppVersion` (looks empty in the shipped `PhotonAppSettings`
+  asset) — try patching a non-empty value via `appidmod`-style same-length-or-
+  offset-aware editing, or test whether an empty AppVersion trips anything
+  via `photon-realtime`.
+- Decrypting Outbound's actual encrypted failure response is **not possible
+  from a passive capture** — Diffie-Hellman specifically prevents that. It
+  would require hooking Outbound's own compiled Fusion code at runtime to
+  read the AES key as generated, a materially more invasive step not
+  attempted yet.
 
 ## Security and repository rules
 
