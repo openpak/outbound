@@ -1,6 +1,8 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-08-28 (retail rejection reason decoded; test-app blocker open)
+Last updated: 2026-08-28 (root cause found — Photon Cloud's built-in NintendoSwitch
+auth provider requires certified Nintendo partnership; pivoted to self-hosting a
+forked Photon-compatible server instead of Photon Cloud)
 
 ## Objective
 
@@ -239,24 +241,91 @@ empty/default (`"1.0"`).
   `npm install photon-realtime` if needed again; useful for isolating
   whether a failure is app-side or Outbound-client-side.
 
+### Root cause found: Photon Cloud's built-in `NintendoSwitch` auth provider
+
+Ruled out via `/tmp/photon-probe` (official `photon-realtime` npm SDK):
+
+- Empty `AppVersion` alone connects and joins the lobby fine — not the cause.
+- A same-size binary `ClientAuthenticationData` payload via that JS SDK does
+  reproduce `32755`/`CustomAuthenticationFailed`, but this is **inconclusive**
+  — the JS library's own serializer has no special-cased `Uint8Array`/byte-array
+  handling (checked its source directly), so this may just be a client-library
+  quirk, not a real server-side rejection of well-formed binary auth data.
+
+The actual answer: Photon's `CustomAuthenticationType` enum has a **dedicated
+built-in `NintendoSwitch = 11`** value, distinct from generic `Custom = 0`.
+Confirmed Outbound's compiled binary contains this exact enum (found the
+literal `NintendoSwitch` string in `global-metadata.dat`, in the same order
+as Photon's own enum: `Oculus PlayStation Viveport NintendoSwitch
+Playstation...`). This explains every symptom: never reaches `authbridge`
+(wrong provider entirely), unaffected by every Custom-Auth dashboard toggle
+(those only govern the `Custom` provider), and matches retail's exact
+wording `"Nintendo validation failed"` (reads like Photon's own built-in NSA
+integration relaying Nintendo's real answer, not a third-party webhook).
+Our test apps' "Add a new authentication provider" list never even offered
+`NintendoSwitch` as an option — console platform auth providers are gated
+behind a certified developer partnership with the platform holder, which
+Photon Cloud requires before exposing that option, and which Reference
+doesn't have.
+
+Two ways forward were considered:
+
+- **Patch the client** to request `Custom` instead of `NintendoSwitch`. Not
+  pursued — `ClientAuthenticationType` is set by compiled game code, not a
+  data asset, so this means disassembling and patching native ARM64 code.
+  Much bigger and riskier than anything done so far, real game-cracking
+  territory.
+- **Self-host a Photon-protocol-compatible server instead of Photon Cloud.**
+  ✅ **Chosen.** The `NintendoSwitch` gating is a Photon Cloud dashboard/SaaS
+  restriction, not a protocol requirement — a server we run ourselves has no
+  such gate; we can accept any `ClientAuthenticationType` value and run our
+  own verification regardless of what the client claims.
+
+## Self-hosted Photon server (current direction)
+
+Forked `Krilliac/Blackice-Server` → `github.com/tobagin/Blackice-Server` →
+cloned locally to `~/REPOS/earlier-photon`. That project is an
+independent, GPLv3, clean-room Photon-protocol server originally built for a
+different Unity/Photon game ("Black Ice", PUN not Fusion) — same ethos as
+this project (no copyrighted game assets, own a legitimate copy to use it).
+It already has a tested Name/Master/Game server implementation including the
+Oakley-768 DH + AES crypto and GpBinary codec this investigation independently
+reverse-engineered by hand (see `docs/research.md`), so this isn't a
+from-scratch protocol implementation.
+
+**License note:** GPLv3. Building on it means this server's code stays
+GPLv3-compatible — a deliberate choice, not an oversight.
+
+**Scope note:** this is meant to become a general-purpose Photon-compatible
+server for *any* earlier game, not an Outbound-only fork. When adapting it:
+keep the identity/auth backend pluggable (swap Black Ice's SteamId/Steam-
+ticket validation for a earlier identity provider, not hardcoded to
+Outbound), keep per-game config (App ID, title ID, auth requirements)
+data-driven, and keep whatever's genuinely Black-Ice-specific (its PUN
+room/game-mode logic) isolated from the shared transport/auth core.
+
+Status: forked, cloned, builds clean (`dotnet build server/BlackIce.Server.sln`).
+Tests can't run yet — only .NET 9 runtime is installed, the project targets
+.NET 8, and installing the matching runtime needs `sudo` (not done).
+
 ### Next step
 
-Figure out what's different about Outbound's real `Authenticate` request
-that a real Photon SDK client doesn't do. Leads, in rough order of promise:
+Get Outbound's raw UDP handshake completing against this server locally,
+accept-all style (mirroring `authbridge`'s current stance — no real earlier
+verification yet, just proving the transport/auth flow completes), before
+touching real identity verification:
 
-- Whether Outbound sends its custom-auth token as binary
-  `ClientAuthenticationData` vs. a string `ClientAuthenticationParams` —
-  untested against a real compiled SDK (only tested via `photon-realtime`'s
-  own possibly-imperfect binary serialization, which isn't conclusive).
-- The client's `AppVersion` (looks empty in the shipped `PhotonAppSettings`
-  asset) — try patching a non-empty value via `appidmod`-style same-length-or-
-  offset-aware editing, or test whether an empty AppVersion trips anything
-  via `photon-realtime`.
-- Decrypting Outbound's actual encrypted failure response is **not possible
-  from a passive capture** — Diffie-Hellman specifically prevents that. It
-  would require hooking Outbound's own compiled Fusion code at runtime to
-  read the AES key as generated, a materially more invasive step not
-  attempted yet.
+1. Point Outbound's DNS resolution of `ns.photonengine.io` at this server
+   instead of Photon Cloud — Citron's existing DNS-redirect capability
+   (`sfdnsres.cpp`, see "Citron build and modifications" above) should cover
+   this; it was originally built for exactly this kind of redirect.
+2. Confirm the Name Server → Master Server → Game Server flow completes
+   against the local server for *any* `ClientAuthenticationType` value,
+   ignoring what the client claims.
+3. Only after that, design the real earlier identity verification to
+   replace the accept-all stance — this is the point where `authbridge`'s
+   role either gets absorbed into this server or stays as a separate
+   verification call it makes internally.
 
 ## Security and repository rules
 
