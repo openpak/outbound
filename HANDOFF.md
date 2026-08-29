@@ -1,11 +1,11 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-08-29 (four real server-side bugs found and fixed this
-session against the live Switch/Citron client — missing eNet fragment
-reassembly, lobby-name scoping, ad-hoc room rejection, missing
-MasterClientId — classic Photon LoadBalancing now completes end-to-end for a
-real Switch client; new confirmed blocker is one layer up, in Fusion's own
-proprietary session-bootstrap protocol)
+Last updated: 2026-08-29 (classic Photon LoadBalancing AND Fusion's session
+bootstrap (Join/Confirmation/NetworkConfigSync/Start) both now work
+end-to-end for a real Switch client, ground-truth-verified byte-for-byte
+against a real Photon Cloud capture; new confirmed blocker is Fusion's
+real-time state-sync protocol, event code 101 — a substantial separate
+subsystem, not yet started)
 
 ## Objective
 
@@ -623,52 +623,137 @@ redirect to the Game server → `Authenticate` → `JoinGame` accepted
 code). This is confirmed directly from `--trace` server logs on a live
 Switch session, not inference.
 
-### Current confirmed blocker: Fusion's own session-bootstrap protocol
+### Fusion's Join/Start session bootstrap: implemented and ground-truth-verified
 
 Immediately after the Game-server `JoinGame` succeeds, the client sends its
 first Fusion-layer message: `OpRaiseEvent` with event code `100` ("protocol
-package" — see the `RegisterProtocolMsg` table above; a 28-byte
-`CustomEventContent` payload, almost certainly a `Join` message given it's
-sent right after entering the room). Our server has no logic that
-understands or replies to this — `GameServerHandler` only does generic
-classic-Photon event relay, and there's no other real peer in the room to
-relay it to even if it tried. The client waits **~30 seconds**, gets no
-response, then cleanly calls `OpLeave` and disconnects — Citron shows
-**"connection interrupted (1020)"**, a new/different code from the earlier
-failures, consistent with this being a distinct, later-stage wall.
+package" — see the `RegisterProtocolMsg` table above). This turned out to be
+a **real, documented wire format**, not opaque client behavior: Fusion's
+decompiled `Fusion.Sockets.dll` (`Fusion.Protocol` namespace) contains actual
+`Message`/`Join`/`Start`/etc. classes with real `Serialize`/`SerializeProtected`
+methods — a genuine (if unpublished) spec, not something that had to be
+inferred purely from behavior.
 
-This is the expected shape of the problem: a real Photon Server needs
-Photon's separate, commercial **Fusion plugin** (not just the classic
-LoadBalancing application) to understand and drive this session-bootstrap
-exchange — we don't have that plugin's source, only the client-side
-decompiled `Fusion.Runtime`/`Fusion.Sockets`. Implementing it will require
-protocol inference rather than a spec.
+**The wire format is bit-packed, not byte-aligned** — fields as small as one
+bit (`WriteBool`), one byte, or N bytes are packed back-to-back with no
+padding except at the very end. Traced the exact algorithm from
+`BitStream.WriteByteAt`/`InternalReadByte` (LSB-first within each byte,
+multi-byte ints written low-byte-first) and reimplemented it clean-room as
+`BlackIce.Photon/FusionProtocol.cs` (`FusionBitReader`/`FusionBitWriter`) —
+**never** by loading or executing the proprietary DLL itself (loading it via
+reflection hit an unrelated native `NanoSockets` dependency chain and was
+abandoned; the bit-packing algorithm is simple enough to reimplement
+directly from reading the decompiled source as a spec, the same technique
+used throughout this project). A `~/photon-oracle/oracle.csproj` scratch
+tool exists locally for this kind of research (gitignored by being outside
+any repo, per the project's existing DLL-research convention) but the final
+codec has zero dependency on it or the DLLs.
+
+Implemented in `GameServerHandler.HandleRaiseEvent`:
+- On a `Join` message with `Type=Request`: reply with a `Join` `Confirmation`
+  (`FusionProtocol.EncodeJoinConfirmation`), and stash the decoded request on
+  `PeerRoomState.PendingFusionJoin` — **do not** send `Start` yet.
+- On the client's own follow-up `NetworkConfigSync` (message id `2`,
+  triggered by the Confirmation's `JoinRequests` flags): send `Start`
+  (`FusionProtocol.EncodeStart`), then clear the pending state.
+
+**Sequencing matters and isn't optional.** The first version sent
+`Confirmation` and `Start` back-to-back immediately, which is what a naive
+reading of the decompiled `HandleStartMessage`/`HandleJoinMessage` suggests
+should work — the client still requires `sender==0` on both, but not that
+they arrive at any particular pace. In practice, sending both at once raced
+the client (observed against a real live Switch session) into calling
+`OpLeave` and disconnecting almost instantly (~0.16s), even after the
+message *content* was independently verified correct (see below) — this
+only became reproducible against our own near-zero-latency local server;
+real Photon Cloud's natural network RTT happens to separate these steps
+enough that the race never manifests there. **Every field value below was
+independently confirmed** by cross-testing Outbound on Steam against real,
+unredirected Photon Cloud (repeating today's earlier proven technique — see
+"Cross-test against Outbound on Steam" above) and decoding the actual
+server response bytes with the exact same bit-reader — a genuine "Host
+Session" that succeeded, room code `JWN7NE`. This caught three fields a
+plausible-looking guess had gotten wrong:
+
+| Field | Guessed | Real server | 
+|---|---|---|
+| `Join Confirmation` `PeerMode` | `Server` (1) | **`Client`** (2) |
+| `Join Confirmation` `JoinRequests` | `None` (0) | **`NetworkConfig`** (2) |
+| `Join Confirmation` `UniqueId` | `null` | **present, 8 random bytes** |
+| `Join Confirmation`/`Start` `CustomData` | `null` | **`""`** (empty string, not null) |
+| `Start` `RemoteServerID` | `0` | `0` ✓ (already correct) |
+| `Start` `StartRequests` | `ConnectToShared` (2) | `ConnectToShared` (2) ✓ (already correct) |
+
+The real server's `Confirmation`/`Start` payloads decoded with **zero
+leftover bits** (300/304 and 193/200 — the remainder in each case is exactly
+the trailing byte-alignment padding), confirming the field layout and order
+are exactly right, not coincidentally close. Both exact byte sequences are
+pinned as regression fixtures in `FusionProtocolTests.cs`
+(`RealCapturedConfirmation`/`RealCapturedStart`).
+
+**Confirmed live**: with sequencing and all field values fixed, a real
+Switch client now completes the *entire* bootstrap correctly —
+`Join Request` → `Confirmation` → client's own `NetworkConfigSync`
+(fragmented, reassembled correctly by the earlier eNet fix) → `Start`. This
+is the full extent of what "Fusion session bootstrap" means at the protocol
+level, and it now works end-to-end, verified byte-for-byte against ground
+truth, not just "stopped erroring."
+
+### Current confirmed blocker: Fusion's real-time state-sync protocol (event code 101)
+
+Even with a byte-perfect `Start`, the client still disconnects shortly after
+(~120ms) — but the *reason* is now understood precisely, from the same real
+Steam capture: immediately after receiving `Start`, the real client sends
+its own message on a **different** event code — `101` ("DATA", not `100`
+"protocol package") — whose payload's tail exactly matches the server's own
+`UniqueId` bytes echoed back (`98 0c e9 ba a7 28 63 7b`, confirmed
+byte-for-byte against the `Confirmation` we decoded). The real server
+replies **within ~40ms** on that same code-`101` channel, after which real
+simulation-tick data starts flowing continuously in both directions
+(repeating code-`101` events, growing payloads consistent with a tick
+counter).
+
+Our server sends nothing at all on event code `101`. The client's own
+"ready"/first-tick message gets no reply, and it gives up — this is almost
+certainly a distinct, much shorter timeout specific to this handshake than
+the 120s `StartGameOperation` deadline (the earlier bootstrap-only tests
+without a `Start` message at all failed at exactly 120s; with a correct
+`Start`, failure now happens in ~120ms, an entirely different order of
+magnitude, pointing at a different wait condition).
+
+This is Fusion's actual **real-time state synchronization protocol** — not
+part of the one-time session bootstrap at all. It's the mechanism by which
+game/vehicle/physics state actually gets synced between host and clients
+every tick, and is a substantial separate subsystem (tick-based snapshot
+encoding, likely delta-compression, actual game state — not just a
+handshake) rather than a small follow-up fix. This is the natural end of
+today's session's scope.
 
 ### Next step
 
-1. Implement enough server-side handling of `RegisterProtocolMsg` code `100`
-   (`Join`, per the table above) to complete a **solo-host** bootstrap — no
-   second real peer needed yet, just whatever handshake Fusion's own client
-   logic is waiting to see before it stops blocking on `StartGameOperation`
-   (`Fusion.Runtime`, decompiled, `StartGameModeCloud`). Two ways to get the
-   exact expected byte layout, in order of reliability:
-   - **Preferred:** repeat today's proven technique — cross-test against
-     Outbound on Steam (same App ID, same Fusion protocol, much faster
-     iteration than Citron) against **real, unredirected Photon Cloud**, and
-     capture the actual server-side response bytes to compare against our
-     own `--trace` output byte-for-byte. This is exactly how the port and
-     lobby-scoping bugs were solved today — it beats blind protocol
-     inference every time it's been tried.
-   - Fallback: infer the minimal valid reply purely from the decompiled
-     client logic (`AsyncOperationHandler<ShutdownReason>` /
-     `StartGameOperation.Task` completion conditions in `Fusion.Runtime`,
-     around `StartGameModeCloud`), without a real capture to verify against.
-2. Once a solo host completes the bootstrap and reaches gameplay, then
-   implement enough of `ReflexiveInfo`/`Start`/`PlayerRefMapping` for a
-   **second** real client to actually join — this needs a genuine two-peer
-   test (two Switches, or one Switch + one Steam client, both against our
-   server).
-3. Only after gameplay-level connectivity works for 2+ peers does real
+1. Understand event code `101`'s wire format the same way `100` was solved:
+   capture a real Steam session (same proven technique), and this time also
+   check whether `Fusion.Sockets`/`Fusion.Runtime`'s decompiled source has
+   real classes for whatever's inside a `101` payload (the `100` channel
+   turned out to have a genuine spec in `Fusion.Protocol` — `101`/`102`
+   might too, or might be raw simulation-state bytes with no equivalent
+   documented structure).
+2. Implement enough of a reply to the client's first `101` message (the
+   "ready"/reflexive-echo one, containing the server's own `UniqueId` sent
+   back) to stop it from timing out — this is the next concrete, scoped
+   target, analogous to today's `Join`→`Confirmation` step but one layer
+   deeper.
+3. Once a **solo host** stays connected and reaches an actual in-game state
+   (not just "didn't disconnect"), figure out what minimal continuous
+   `101` traffic (if any) is needed to keep the connection alive — real
+   Photon Cloud showed continuous bidirectional `101` events even for a
+   solo session, so this likely isn't optional even before a second real
+   player exists.
+4. Only after that does implementing enough of `ReflexiveInfo`/
+   `PlayerRefMapping`/`ChangeMasterClient` for a **second** real client to
+   actually join become relevant — needs a genuine two-peer test (two
+   Switches, or one Switch + one Steam client, both against our server).
+5. Only after gameplay-level connectivity works for 2+ peers does real
    earlier identity verification become relevant (replacing the current
    accept-all anonymous-LAN stance) — `authbridge`'s role would then either
    get absorbed into this server or stay as a separate verification call it
