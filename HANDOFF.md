@@ -1,9 +1,11 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-08-29 (Fusion SDK decompiled — found it layers its own
-session-negotiation protocol + a separate raw-UDP transport with NAT-punch/
-STUN on top of classic Photon; the still-unidentified 13-byte packet to Master
-server blocks the connection on both Steam and Switch)
+Last updated: 2026-08-29 (four real server-side bugs found and fixed this
+session against the live Switch/Citron client — missing eNet fragment
+reassembly, lobby-name scoping, ad-hoc room rejection, missing
+MasterClientId — classic Photon LoadBalancing now completes end-to-end for a
+real Switch client; new confirmed blocker is one layer up, in Fusion's own
+proprietary session-bootstrap protocol)
 
 ## Objective
 
@@ -390,47 +392,95 @@ previously-open questions with real evidence instead of inference:
   no Steam ticket validator compiled in, so it's currently accepting any
   Steam client unverified — fine for this diagnostic, not for production).
 
-### Current blocker: unidentified packet to the Master server
+### Mystery packet, SOLVED: wrong Master/Game ports, not a protocol bug
 
-Immediately after a successful `GetRegions` (within ~6ms), the client opens
-a *separate* connection to the Master address we handed back and sends a
-13-byte UDP packet: `7D 7D 7D 7D 7D 7D 7D 7D 7D 7D 7D 7D <varies>` — twelve
-`0x7D` bytes then one differing trailing byte. This does **not** match the
-real Photon `Connect` command seen everywhere else in this investigation
-(`FF FF 00 01 ... 02 FF 01 04 ...`). Parsed through `PhotonHeader.ReadFrom`
-it decodes to nonsense (`CommandCount=125`, `ServerTime=2105376125`) and
-zero commands, so our server sends no reply at all.
+The 13-byte `7D×12+1` packet to the Master port was a red herring — it's
+Fusion's own NAT-reachability probe (`NetPeerGroup`, see below), a
+best-effort side channel, **not** what the client actually needs to proceed.
+Confirmed by capturing real Photon Cloud traffic (see "Cross-test" below):
+the same probe shape gets sent to real Cloud addresses on port `5055` too,
+in parallel, and real Photon Cloud doesn't appear to specially answer it
+either — the client just doesn't wait on it.
 
-The client **retries this exact packet 5 times, ~1.2s apart**, gets nothing
-back either time, then goes silent (the connection is later evicted after
-10s of inbound silence, on our side). This retry-then-give-up timing lines
-up with when "A Photon error has occurred" appears, on both the Steam and
-Switch clients. Confirmed reproducible: the same shape occurred both times
-the Steam client was tested independently.
+**The real bug:** Photon's modern client-side default UDP port table
+(`Photon.Realtime.ProtocolPorts.Udp`, real source, `ProtocolPorts.cs`) is
+`NameServer=27000, MasterServer=27001, GameServer=27002` — not the "old"
+`5058/5055/5056` scheme this server (and Photon's own docs default) assumed.
+Critically, **the client does not use whatever port a server hands back** in
+the `Authenticate`/`GetRegions` response's `Address` field — real client
+code (`RealtimeClient.cs`, real source):
+```csharp
+// on the NameServer, authenticate returns the MasterServer address for a
+// region and we hop off to there
+this.MasterServerAddress = operationResponse[ParameterCode.Address] as string;
 
-**Ruled out:** it isn't Steam-specific network noise unrelated to Photon —
-the timing (6ms after `GetRegions` succeeds) is too tight to be coincidence.
+ushort replacementPort = this.ProtocolPorts.Get(this.RealtimePeer.TransportProtocol, ServerConnection.MasterServer);
+if (replacementPort != 0)
+{
+    this.MasterServerAddress = ReplacePortWithAlternative(this.MasterServerAddress, replacementPort);
+}
+```
+It takes only the **host** from our response and always **replaces the
+port** with its own client-side table. So every earlier test where we tried
+different addresses/ports in `GetRegions`/`Authenticate` responses could
+never have mattered — the client was always going to connect to `<our
+host>:27001` regardless, and this server never listened there. Confirmed
+directly against real Photon Cloud packet captures: the real Master hop for
+this session went to `87.120.167.220:27001`, a completely different IP than
+the NameServer's `216.120.180.19:27000` and a completely different port
+than the classic `5055` default — real Photon Cloud servers are dynamically
+load-balanced across a large fleet, port included.
 
-**Not yet known:** what this packet actually is. Candidates considered but
-unconfirmed: a lightweight NAT "punch"/reachability probe Photon's client
-sends before a full connect (content is low-entropy/repeated, which fits a
-throwaway probe better than real protocol data or ciphertext — real AES
-output wouldn't repeat a byte 12 times); a CRC-enabled packet whose header
-layout differs from the CRC-disabled one `PhotonHeader.ReadFrom` always
-assumes (it's the *only* `crc=true` packet seen in the entire investigation,
-every other exchange — all of which work — was `crc=false`); or something
-from a different subsystem entirely. Web search turned up no public
-documentation of this packet shape.
+**Fix applied** (`earlier-photon`, committed): `ServerPorts.MasterServerAlt`
+and `GameServerAlt`, same pattern as the existing `NameServerAlt` — optional
+second listeners sharing the primary role's handler. Run with all three set
+to get the modern port triplet:
+```sh
+BLACKICE_Server__Ports__NameServerAlt=27000 \
+BLACKICE_Server__Ports__MasterServerAlt=27001 \
+BLACKICE_Server__Ports__GameServerAlt=27002 \
+dotnet run --project server/BlackIce.Server.Host -- <advertised-host>
+```
+No change needed to what address/port `NameServerHandler` sends back — the
+client ignores the port anyway, only the host matters.
 
-### Reproducing this investigation
+**Validated true via a real-Photon-Cloud packet capture** (`sudo tcpdump`,
+needs the user's hands-on involvement — confirmed `tcpdump -i lo` needs root
+on this machine, and Steam/Proton traffic goes out the real network
+interface even to loopback-adjacent addresses, not `lo`, so `-i any` was
+needed). Full real session captured: NameServer (`27000`) → Authenticate
+succeeds → separate connection to Master (`27001`, different IP) → separate
+connection to the actual room/relay server (`27002`, yet another IP,
+`80.93.214.90` in one capture) with sustained real traffic (large fragmented
+packets — live room/game state). Three distinct hops, three distinct real
+IPs, exactly matching the modern port triplet.
 
-- Server: `cd earlier-photon && DOTNET_ROLL_FORWARD=LatestMajor
-  BLACKICE_Server__Ports__NameServerAlt=27000 dotnet run --project
-  server/BlackIce.Server.Host -- 127.0.0.1 --trace` (`--trace` for full
-  packet hex dumps, needed to see the Master-port packet's raw bytes).
-- Switch (Citron): `OPENPAK_PHOTON_IP=127.0.0.1 ./build/use-nopgo/bin/citron`.
-- Steam: `echo "127.0.0.1 ns.photonengine.io" | sudo tee -a /etc/hosts`,
-  launch Outbound normally, **remove the hosts line afterward**.
+### Cross-test against Outbound on Steam — validates the fix
+
+Outbound is also owned on Steam (`/mnt/games/SteamLibrary/steamapps/common/Outbound`,
+same IL2CPP layout as Switch, **same Photon App ID**
+`cffbe809-5036-43d8-84a1-7bf16c924721`). Redirected via `/etc/hosts`
+(`127.0.0.1 ns.photonengine.io`) for much faster iteration than Citron —
+**purely a diagnostic technique**, doesn't touch or replace the Citron
+`OPENPAK_PHOTON_IP` redirect used for the actual Switch target.
+
+Findings, all real client behavior (not our own probes):
+- **Steam build uses `ClientAuthenticationType=1` (`Steam`), not
+  `NintendoSwitch`** — confirms different platforms use different auth
+  providers on the same Photon app.
+- Auth data sent via `ClientAuthenticationParams` (216) as a **string**
+  (`"ticket=<hex>..."`), settling that open question from the earlier
+  Photon-Cloud test-app investigation.
+- `AppVersion` really is sent as `""` — confirmed on real traffic, not a
+  mistake in our own probes.
+- With the `MasterServerAlt`/`GameServerAlt` fix in place, our server's
+  `OpAuthenticate` (on the alt NameServer port) accepted a real Steam auth
+  request cleanly (`rc=0`), via the existing anonymous-LAN fallback (no
+  real Steam ticket validator compiled in yet — fine for this test, not for
+  production), and the Steam client's UI **generated real room codes**
+  multiple times in a row when redirected at our own server — the
+  `GetRegions`/`Authenticate`/port-triplet flow now works end-to-end for a
+  Steam-authenticated client.
 
 ### Fusion SDK research: architecture is bigger than "GpBinary relay"
 
@@ -449,7 +499,9 @@ material — kept under `~/photon-oracle/`, gitignored by being outside any
 repo).
 
 **Key finding: Fusion layers its own session-negotiation protocol on top of
-classic Photon**, registered via `RegisterProtocolMsg`:
+classic Photon**, registered via `RegisterProtocolMsg` — this table is still
+accurate and is exactly the layer the live Switch client is now stalled on
+(see "Current confirmed blocker" below):
 
 | Code | Message | Purpose (from decompiled source) |
 |---|---|---|
@@ -473,78 +525,153 @@ our existing `MasterServerHandler`/`GameServerHandler` (already relay
 `RaiseEvent`) — **but only after a room is actually created/joined**, since
 `RaiseEvent` needs a joined room/game context.
 
-**The problem: the mystery Master-port packet fires far too early for this.**
-Timing evidence (both the Steam test runs): the client's first datagram to
-the Master address lands **within ~6-30ms of `GetRegions` succeeding** — long
-before any `Authenticate`/`CreateGame`/`JoinGame` operation is even attempted
-on that connection (in the `--trace` run, real `OpAuthenticate` only
-succeeded ~10+ seconds later, on a *different* reconnect to the alt port).
-This packet cannot be the `Start`/`ReflexiveInfo` RaiseEvent exchange above —
-there's no room yet for `RaiseEvent` to target. It must be something earlier
-and separate.
+The 13-byte `7D×12+1` "mystery packet" mentioned in earlier notes was Fusion's
+own NAT-reachability probe (`NetPeerGroup`, the raw transport described
+above) — a best-effort side channel confirmed to also fire against real
+Photon Cloud in parallel with a working session, so it's not on the critical
+path and needs no fix. It was a distraction from the real, much simpler
+bugs below, all found this session by running `earlier-photon` with
+`--trace` against the **live Switch + Citron + OpenPak client** (not Steam)
+and reading the byte-level transport log until the discrepancy from expected
+behavior was obvious.
 
-**Leading (unconfirmed) theory: Fusion's own raw transport layer
-(`NetPeerGroup`), not classic Photon at all.** `Fusion.Sockets.dll` contains
-an entirely separate low-level reliable-UDP implementation — `NetPeerGroup`/
-`NetConnection`/`NetCommands`/a 32-byte `Header` struct with sequence/ack/
-fragment fields, `NetPacketType` enum (`V2=250, Command=1, UnreliableData=2,
-Unconnected=5, MtuDiscoveryReq=6, MtuDiscoveryRep=7, NotifyReliableData=8`),
-plus a built-in STUN client (`StunClient`, real `STUN_MAGIC_COOKIE` constant)
-and NAT-punch state machine (`NATPunchStage`: `Local → Public → Relay`,
-gated by `IsNATPunchthroughEnabled`). This looks like Fusion's *own* game/
-relay-server transport, independent of the classic PUN-style Master/Game
-two-hop dance our server (forked from a PUN game) implements. Unconfirmed
-whether the captured 13-byte packet (`7D×12` + 1 varying byte) is one of
-these — none of `NetPacketType`'s enum values (1/2/5/6/7/8/250) matches
-`0x7D` as a first byte in plaintext, so if this is `NetPeerGroup` traffic
-it's likely either obfuscated/XORed (the STUN client's own real messages
-have a distinct, different, well-documented header — this isn't a STUN
-message) or something not yet located in the decompiled surface (possibly
-native — `NativeSocket`/`_nativeSocket`/`NetSocketNative` strings suggest
-part of this layer may not even be managed IL Unity can decompile).
+### Four real bugs found and fixed this session (live Switch client)
 
-**What's ruled out:** our server already handles this packet as gracefully
-as a generic implementation reasonably can — `PhotonHeader.ReadFrom` doesn't
-validate anything, so 13 bytes of `0x7D` gets parsed as a header claiming
-`CommandCount=125`, but the command-parsing loop's bounds check
-(`offset + NCommand.HeaderSize <= datagram.Length`) never executes even once
-against a 13-byte total datagram, so zero commands are extracted and nothing
-happens — no crash, no reply, matching exactly what was observed. There is
-no bug to fix here; the packet is real client behavior our protocol
-implementation doesn't recognize, not a parsing defect.
+Each was found the same way: run the server with `--trace`, drive an actual
+Host Session attempt from Citron, and read the raw eNet/Photon trace until
+the client's behavior stopped matching what the server assumed. Each fix
+moved the failure visibly further down the connection flow — confirmed by
+the Citron error screen changing each time (generic "A Photon error has
+occurred" → "connection interrupted (1001)" → "connection interrupted
+(1020)"), not just by log inspection.
 
-**What would actually resolve this:** a genuine packet capture of a
-*working* Outbound (Steam) session against real, unredirected Photon Cloud,
-compared byte-for-byte against our captures at the same stage. This needs
-`sudo tcpdump` (confirmed this session — plain `tcpdump -i lo` fails with
-`CAP_NET_RAW may be required` for this user) and a live play session, so it
-needs the user's hands-on involvement (running the capture themselves,
-launching the game) — not something continuable unattended. Suggested
-command once ready:
-```sh
-sudo tcpdump -i lo -w outbound-real-photon.pcap 'udp and (port 5058 or port 27000 or port 5055)'
-```
-Remove the `/etc/hosts` redirect first so traffic actually reaches Photon
-Cloud, launch Outbound, try Multiplayer, stop the capture, then diff the
-Master-hop bytes against `docs/research.md`'s existing captures.
+**1. eNet `SendFragment` (command type 8) was never implemented —
+`earlier-photon`.** `EnetPeer.HandleCommand`'s switch had no case for it; a
+fragmented reliable send got the generic transport ACK (satisfying eNet, so
+the client never retransmitted) but its payload was silently dropped —
+`appPayload` stayed null, so it never reached `OnOperationRequest`. This is
+why the Switch client looked like it "never sends `Authenticate`": its real
+`Authenticate` request — `ClientAuthenticationType=NintendoSwitch` (11) plus
+the full signed BAAS token as `ClientAuthenticationParams`, ~1474 bytes
+total — exceeds one UDP datagram and gets fragmented into two `SendFragment`
+commands, which the server ignored, leaving the client waiting forever on a
+response that would never come (pure eNet `Ping`/`Ack` keepalive, confirmed
+byte-for-byte via `--trace` — ruling out the alternate theory that the
+client was reacting to a wrong/malformed server answer). Fixed in
+`BlackIce.Photon/Transport/EnetPeer.cs` (`HandleFragment`, reassembly keyed
+per-channel by start sequence number). **Got the field layout wrong on the
+first attempt** — assumed a 6-field/24-byte sub-header (adding a redundant
+`fragmentLength` field); the real layout, verified byte-for-byte against the
+live capture, is 5 big-endian `int32` fields (`startSeq, fragmentCount,
+fragmentNumber, totalLength, fragmentOffset`, 20 bytes total) with
+`fragmentLength` implicit as `payload.Length - 20`. Cross-checked against
+two real fragments: `totalLength=1474`, fragment 1 `offset=0 len=1152`,
+fragment 2 `offset=1152 len=322` — `1152+322=1474` exactly. Tests:
+`TransportTests.SendFragment_reassembles_across_two_fragments` and
+`..._still_acks_each_fragment_individually`.
+
+**2. `OpJoinLobby`/`GameList` ignored the client's requested lobby name —
+`MasterServerHandler.cs`.** Fusion joins a lobby *named after its own
+session code* (`ParameterCode.LobbyName`=213, e.g. `"JNNC7E"`) before
+hosting, presumably to check whether a room under that code already exists.
+Our server always pushed back its own hardcoded Black Ice realm list
+regardless of the requested lobby, which the client silently couldn't use —
+it just sat there afterward (pure keepalive pings, no `CreateGame`/`JoinGame`
+ever sent, no error, spinner forever). Fixed: only the **default** (unnamed)
+lobby gets the Black Ice realm list now; any **named** lobby gets an empty
+`GameList`, which unblocked the client immediately — it proceeded straight
+to a real `OpJoinGame` on Master carrying the actual room code and Fusion's
+own room properties (`scene`, `vehicleType`, `version`, plugin name
+`"FusionPlugin"`, etc.).
+
+**3. `GameServerHandler.EnterRoom` rejected any room name that wasn't a
+pre-configured "realm".** BlackIce's whole room model is fixed, named,
+persistent realms (`"Black Ice — Co-op"` etc.) — there's no concept of an
+ad-hoc client-created room. Fusion is the opposite: every "Host Session"
+click creates a brand-new room under a random 6-character code, never a
+pre-configured name — so every join attempt got `rc=-4 "No such realm"`,
+and Citron showed **"connection interrupted (1001)"**. Fixed: only a
+*known, disabled* realm is rejected now; a room name that doesn't match any
+configured realm is treated as an open ad-hoc room (same behavior as when no
+realms are configured at all, which tests already covered). Test renamed/
+added: `EnterRoom_allows_ad_hoc_room_not_matching_any_realm`,
+`EnterRoom_rejects_disabled_realm`.
+
+**4. The well-known Photon room property `MasterClientId` (247/248, inside
+`GameProperties`) was defined as a constant (`PhotonCodes.RoomProperty.
+MasterClientId`) but never actually populated anywhere.** Every Photon/Fusion
+client reads this to know who's authoritative for the room. Its absence
+looked to Fusion like a room with no valid master: the client's own
+`OpJoinGame` succeeded (`rc=0`, correct `ActorNr`), but it then immediately
+called `OpLeave` and disconnected cleanly — Citron showed **"connection
+interrupted (1001)"** again, this time *after* a successful-looking join
+rather than at the join itself, which is what pointed at a
+response-content problem rather than a rejection. Fixed: `EnterRoom` now
+always stamps `GameProperties[MasterClientId] = room.ActorNumbers.Min()`
+(standard Photon convention — the lowest/longest-present actor number).
+Test: `EnterRoom_stamps_master_client_id_as_lowest_actor`.
+
+### Current confirmed state: classic Photon LoadBalancing works end-to-end
+
+With all four fixes, a real Switch + Citron + OpenPak client now completes
+the **entire** classic Photon connection flow against our self-hosted
+server: `GetRegions` → `Authenticate` (NintendoSwitch auth type, real signed
+BAAS token, fragmented and reassembled correctly) → redirect to Master →
+`Authenticate` → `JoinLobby` (scoped correctly) → `JoinGame` on Master →
+redirect to the Game server → `Authenticate` → `JoinGame` accepted
+(`ActorNr=1`, `MasterClientId=1`, room created ad-hoc under the real session
+code). This is confirmed directly from `--trace` server logs on a live
+Switch session, not inference.
+
+### Current confirmed blocker: Fusion's own session-bootstrap protocol
+
+Immediately after the Game-server `JoinGame` succeeds, the client sends its
+first Fusion-layer message: `OpRaiseEvent` with event code `100` ("protocol
+package" — see the `RegisterProtocolMsg` table above; a 28-byte
+`CustomEventContent` payload, almost certainly a `Join` message given it's
+sent right after entering the room). Our server has no logic that
+understands or replies to this — `GameServerHandler` only does generic
+classic-Photon event relay, and there's no other real peer in the room to
+relay it to even if it tried. The client waits **~30 seconds**, gets no
+response, then cleanly calls `OpLeave` and disconnects — Citron shows
+**"connection interrupted (1020)"**, a new/different code from the earlier
+failures, consistent with this being a distinct, later-stage wall.
+
+This is the expected shape of the problem: a real Photon Server needs
+Photon's separate, commercial **Fusion plugin** (not just the classic
+LoadBalancing application) to understand and drive this session-bootstrap
+exchange — we don't have that plugin's source, only the client-side
+decompiled `Fusion.Runtime`/`Fusion.Sockets`. Implementing it will require
+protocol inference rather than a spec.
 
 ### Next step
 
-1. Get a real-Photon-Cloud packet capture (above) to identify the mystery
-   packet definitively.
-2. Once identified: implement whatever it actually requires (most likely
-   either responding to it directly, or telling the client — via some
-   earlier response field we're not yet setting correctly — not to expect
-   this path at all).
-3. Only after the Master-hop connects does implementing the `Start`/
-   `ReflexiveInfo` RaiseEvent exchange (table above) become relevant — that
-   requires a room to exist first (`CreateGame`/`JoinGame`, already partially
-   implemented for Black Ice/PUN in `MasterServerHandler`/`GameServerHandler`,
-   but never tested against a Fusion client).
-4. Only after gameplay-level connectivity works does real earlier identity
-   verification become relevant (replacing the current accept-all
-   anonymous-LAN stance) — `authbridge`'s role would then either get
-   absorbed into this server or stay as a separate verification call it
+1. Implement enough server-side handling of `RegisterProtocolMsg` code `100`
+   (`Join`, per the table above) to complete a **solo-host** bootstrap — no
+   second real peer needed yet, just whatever handshake Fusion's own client
+   logic is waiting to see before it stops blocking on `StartGameOperation`
+   (`Fusion.Runtime`, decompiled, `StartGameModeCloud`). Two ways to get the
+   exact expected byte layout, in order of reliability:
+   - **Preferred:** repeat today's proven technique — cross-test against
+     Outbound on Steam (same App ID, same Fusion protocol, much faster
+     iteration than Citron) against **real, unredirected Photon Cloud**, and
+     capture the actual server-side response bytes to compare against our
+     own `--trace` output byte-for-byte. This is exactly how the port and
+     lobby-scoping bugs were solved today — it beats blind protocol
+     inference every time it's been tried.
+   - Fallback: infer the minimal valid reply purely from the decompiled
+     client logic (`AsyncOperationHandler<ShutdownReason>` /
+     `StartGameOperation.Task` completion conditions in `Fusion.Runtime`,
+     around `StartGameModeCloud`), without a real capture to verify against.
+2. Once a solo host completes the bootstrap and reaches gameplay, then
+   implement enough of `ReflexiveInfo`/`Start`/`PlayerRefMapping` for a
+   **second** real client to actually join — this needs a genuine two-peer
+   test (two Switches, or one Switch + one Steam client, both against our
+   server).
+3. Only after gameplay-level connectivity works for 2+ peers does real
+   earlier identity verification become relevant (replacing the current
+   accept-all anonymous-LAN stance) — `authbridge`'s role would then either
+   get absorbed into this server or stay as a separate verification call it
    makes internally.
 
 ## Security and repository rules
