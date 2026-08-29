@@ -1162,6 +1162,40 @@ thorough. Leaving `GetFriendDetailedInfoV3` failing cleanly (see above)
 remains correct until/unless that firmware-side struct becomes reachable
 some other way.
 
+### 2026-08-29 follow-up 2: the system-firmware side was tried too, hit a real dead end
+
+Pushed one step further rather than stopping at "needs system firmware":
+the actual applet (`0100000000001013`, "MyPage" — real name from
+`AppletProgramId` in `src/core/hle/service/am/am_types.h`, and confirmed
+live: `PatchExeFS for title_id=0100000000001013` fires in citron's log at
+exactly the moment Invite Friends is opened) was already sitting decrypted
+in citron's own installed NAND — no new firmware dump was needed, the user
+already has one from getting LLE applets working at all. Extracted its
+ExeFS with a small scratch addition to `citron-cmd`
+(`src/citron_cmd/citron.cpp`, gated behind an unused `--legacy-nca-
+extract <nca> <out-dir>` flag, reuses citron's own `FileSys::NCA`/keys —
+not meant to stay long-term, citron has no GUI equivalent of Ryujinx's
+"Extract Data → ExeFS" for a *system* title since they aren't in the game
+list either way).
+
+Unlike Outbound, this binary is stripped native Nintendo C++ with zero
+IL2CPP-style metadata to lean on. Located a genuine command-dispatch
+chain in the decompressed `.text` (`mov w8, #0x4e8c` /* 20108 */
+`; cmp w21, w8 ; b.ne <next check>`, part of a real `cmp`-chain matching
+a running "current command" register against many IDs in sequence) and
+followed the match through — it turned out to feed a generic opcode-
+driven state machine/parser (`str x8, [x19, #0xaf0]` then a shared
+dispatch-loop jump), not friend-service-specific marshaling code. An
+earlier broad scan of the whole `.text` section had already found
+thousands of `mov`-immediate hits essentially uniformly spread across the
+entire 20000–30000 range, which fits this being a coincidental numeric
+match on an unrelated opcode, not a real command-ID check. Confirmed
+dead end, not abandoned early: getting the real struct out of this
+binary would need proper decompiler-grade analysis (Ghidra/IDA-class
+tooling with real cross-referencing time), not pattern-matching a
+constant. `GetFriendDetailedInfoV3` staying a clean failure is final for
+now.
+
 ## Security and repository rules
 
 - Never commit `openpak_account.txt`, session tokens, BAAS tokens, keys,
