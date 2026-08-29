@@ -4,11 +4,19 @@ Last updated: 2026-08-29 (classic Photon LoadBalancing AND Fusion's session
 bootstrap (Join/Confirmation/NetworkConfigSync/Start/relay Connect-Accepted)
 all now work end-to-end, ground-truth-verified byte-for-byte against a real
 Photon Cloud capture — AND a genuine Citron socket-emulation bug found and
-fixed (earlier-citron) that was corrupting a socket Fusion needs and
-crashing/hanging every Switch session before this point. Current session now
-survives 25+ seconds with no error, longer than any prior attempt; new
-mystery is a discrepancy between what Citron's own log reports and what our
-server actually receives — needs careful investigation, not yet understood)
+fixed (earlier-citron) that was corrupting a socket Fusion needs. With both
+fixed, the session no longer errors or disconnects at all — it hangs
+instead. Root cause fully diagnosed live via gdb: a second UDP socket
+blocks forever in `recvfrom()` waiting for a peer that never arrives in
+this redirected, no-second-peer setup, and the game's main thread depends
+on it, so every guest CPU core goes idle — a genuine full freeze. Confirmed
+live by sending the blocked socket a single arbitrary UDP packet from the
+host while frozen: the freeze immediately resolved (proving the diagnosis
+exactly), though the game then cleanly exited since the packet wasn't
+valid data. The socket turns out to speak Nintendo's own **PRUDP-Lite**
+P2P transport (not Fusion's own protocol) — Citron already has a header
+decoder for it, giving everything needed to craft a real packet next. This
+is the current, precisely-located wall; not yet fixed.)
 
 ## Objective
 
@@ -763,65 +771,146 @@ entire investigation (every prior test failed within 30s–120ms with an
 explicit disconnect). This is a qualitatively different, better state than
 anything seen before today's server-side protocol work even started.
 
-### Current confirmed blocker: unexplained discrepancy after the socket fix
+### Current confirmed blocker: Fusion's P2P listen socket blocks forever, freezing the whole game
 
-The game now appears to hang (no error dialog) rather than disconnect.
-Investigating that surfaced a genuine, not-yet-understood contradiction:
+With the socket-type-flag bug fixed, the game no longer errors or
+disconnects — it hangs completely. Investigating produced two false leads
+before the real cause, worth recording so they aren't re-chased:
 
-- **Citron's own log** shows what looks like continuing, successful
-  Photon-port traffic (`LogPhotonPacket` TX/RX pairs, `host=ns.photonengine.io
-  peer=…:27002`, regular ~4s Ping/Ack) for 25+ seconds after the new socket
-  binds.
-- **Our server's own `--trace` log**, for the *same* peer/session, shows the
-  client's acknowledgements simply **stop arriving around the same window**
-  — the server's own outgoing keepalive Pings go unanswered and it evicts
-  the peer after its normal 10-second inactivity timeout.
-- Only one Game-server peer connection exists in the server log for this
-  test (no silent reconnect to a new port that would explain the gap), so
-  it isn't simply "a new connection appeared and the old one was correctly
-  abandoned."
+- **False lead 1 — "Citron's log shows traffic past our server's eviction
+  point."** This was a counting error, not a real discrepancy: counting
+  every `LogPhotonPacket` TX/RX entry on the classic Photon connection and
+  comparing to the server's own SEND/RECV trace for the same peer produced
+  **exact matching totals** (e.g. 27 client-TX ↔ 27 server-RECV, 35
+  client-RX ↔ 35 server-SEND). Every packet either side logged genuinely
+  reached the other. There was no gap.
+- **False lead 2 — "Citron logs a Critical panic (`Userspace PANIC!`,
+  `Suspending thread due to unrecoverable break`) partway through."** Both
+  times this was seen, it was immediately preceded by `Frontend <Warning>
+  ForceStop: Force stopping EmuThread` — Citron's own normal shutdown
+  sequence when the emulated process is closed (by the user giving up on a
+  frozen window, or the process being killed for the next test). It's
+  expected noise from closing a frozen session, not a spontaneous crash.
 
-Not yet resolved. Plausible directions, none confirmed:
-- Fusion's NAT-punch/STUN attempts (the new raw socket) are almost certainly
-  **not** covered by the `OPENPAK_PHOTON_IP` redirect at all —
-  `GetPhotonRedirectIp` (`sfdnsres.cpp`) only intercepts **hostname**
-  resolution containing `photonengine.io`; a STUN/NAT-punch destination
-  reached by a hardcoded IP (typical for STUN) would go straight to the real
-  internet, unredirected. If that hangs/times out, it might be stalling
-  something that indirectly affects the (correctly redirected) classic
-  Photon connection too, even though the two look independent.
-- `bsd.cpp`'s `LogPhotonPacket` is gated by destination **port** only
-  (`IsPhotonPort`: 5055/5056/5058/27000–27003) — it doesn't distinguish
-  *which* client fd sent a packet, or independently confirm the syscall
-  actually succeeded on the wire vs. only being attempted. Its continued
-  output isn't hard proof the redirected connection is still genuinely
-  alive from the server's point of view.
-- Needs careful, patient investigation (likely: correlate exact wall-clock
-  timestamps between the two logs precisely, or add fd-aware logging to
-  confirm which socket carries which packet) rather than further guessing —
-  this is where today's session stopped.
+**The real cause**, found by attaching `gdb -p <pid> --batch -ex "thread
+apply all bt"` to a *still-frozen* Citron process (the only way to get a
+real answer — reading logs after closing the window only shows the harmless
+`ForceStop` aftermath):
+
+- All four `CPUCore_0`..`CPUCore_3` threads (the emulated guest CPU cores —
+  i.e. Outbound's own code) are sitting idle in
+  `Core::CpuManager::MultiCoreRunIdleThread()`, meaning **no guest
+  instructions are executing at all**. The Qt UI thread is healthy (just
+  polling for OS window events), which is why the window doesn't crash —
+  it's simply not receiving new frames to display.
+- A citron-internal worker thread (`bsdsocket:2`) is blocked inside a
+  **real, literally-blocking libc `recvfrom()`** call, reached via
+  `Network::Socket::RecvFrom` ← `Service::Sockets::BSD::RecvFrom`. Citron's
+  socket HLE is behaving correctly here — it only avoids blocking when the
+  guest explicitly requests `MSG_DONTWAIT`/`O_NONBLOCK`, or when
+  `SO_RCVTIMEO` is set (both paths are implemented and correct); this call
+  used neither, so citron faithfully blocks exactly as real POSIX
+  `recvfrom()` would.
+- Citron's own log shows **zero further activity of any kind** on this new
+  fd after its `Bind()` succeeds — no `Connect()`, no logged send. The most
+  likely explanation: Fusion opened this UDP socket to *listen* for a
+  future P2P/NAT-punch connection attempt from another player joining the
+  session (standard behavior for a host) and is blocking-`recvfrom()`-ing
+  on it, fully expecting *someone else* to send the first packet. In this
+  solo, `OPENPAK_PHOTON_IP`-redirected setup there is no second peer and
+  nothing will ever arrive — real Photon Cloud sessions presumably don't
+  hit this because a real joining peer's own NAT-punch attempt would
+  eventually reach this socket.
+- Because HOS's IPC model makes the *guest* thread that issued the
+  `recvfrom()` syscall genuinely block until the HLE call returns, and the
+  game's main/logic thread evidently waits synchronously on this step
+  before proceeding (a game-side design choice, not a citron bug), the
+  entire guest OS ends up with no runnable thread — hence all four CPU
+  cores going idle and the total freeze.
+
+This is *not* a citron bug to fix by changing socket blocking semantics —
+faithfully blocking is correct behavior for what the guest asked for, and
+arbitrarily timing out blocking receives generally would risk breaking
+other games' legitimate long-waits. The right fix is upstream: give this
+socket something valid to receive.
+
+### Confirmed live: unblocking it works, and it's Nintendo's PRUDP-Lite protocol, not Fusion's
+
+Found the exact bound port with zero extra tooling — no sudo, no packet
+capture — by just inspecting the running (still-frozen) Citron process's
+own sockets as its own user:
+```sh
+ss -tunap 2>/dev/null | grep <citron-pid>
+```
+This showed two UDP sockets: the healthy, `connect()`-ed classic-Photon
+session (`ESTAB`, `127.0.0.1:<local> ↔ 127.0.0.1:27002`), and a second,
+`UNCONN` socket bound to `0.0.0.0:<ephemeral port>` — never connected,
+matching the blocked listener exactly.
+
+**Sent it one arbitrary UDP packet from the host** (a plain Python
+`socket.sendto()`, 16 zero bytes, to `127.0.0.1:<that port>`) while Citron
+was genuinely frozen. **The freeze resolved immediately** — Citron's log
+picked back up instantly, proving the diagnosis exactly: the guest's
+`recvfrom()` really was the entire blocker, and *any* datagram arriving is
+enough to release it. The game then cleanly shut the emulation down
+(`OnEmulationStopped`) rather than staying frozen or crashing — expected,
+since 16 zero bytes aren't valid data for whatever this socket expects.
+
+**What it actually expects, from Citron's own source**: this is not
+Fusion's own protocol at all — `bsd.cpp`'s `DescribePrudpLite` (already
+present, used for exactly this kind of otherwise-unrecognized P2P traffic)
+decodes it as Nintendo's own **PRUDP-Lite** transport, the lightweight
+P2P-matchmaking protocol from Nintendo's SDK (a reduced version of NEX's
+PRUDP), which Photon's own Switch platform integration apparently sits on
+top of for local P2P/NAT-punch discovery — separate from both classic
+Photon and Fusion's own `Fusion.Protocol` messages. Header format (already
+implemented in Citron, so this is read from real code, not guessed):
+- Byte 0: magic `0x80` (packets without this magic are treated as
+  something else entirely, e.g. Photon Pia — see the `raw[...]=` fallback
+  in `DescribePrudpLite`)
+- Bytes 8–9: `type_flags`, little-endian `u16` — low 4 bits are the packet
+  type (`0`=SYN, `1`=CONNECT, `2`=DATA, `3`=DISCONNECT, `4`=PING), upper
+  bits are flags (`0x001`=ACK, `0x002`=Reliable, `0x004`=NeedACK,
+  `0x200`=MultiACK)
+- Bytes 10–11: `id`, little-endian `u16`
+- Minimum 12 bytes total; bytes 1–7 are other header fields this decoder
+  doesn't break out further (not yet needed — worth decompiling/inferring
+  if a real capture of genuine PRUDP-Lite traffic becomes available)
 
 ### Next step
 
-1. Resolve the Citron-log-vs-server-log discrepancy above before anything
-   else — until it's understood, further protocol work risks being built on
-   a wrong picture of what's actually happening on the wire.
-2. Once the connection is confirmed genuinely stable (not just quiet),
-   understand event code `101`'s *ongoing* traffic — the `Connect`/
-   `Accepted` handshake above is only the relay transport's own connection
-   setup; real Photon Cloud showed continuous bidirectional `101` events
-   after that (repeating, growing payloads consistent with tick-based
-   simulation snapshots) that this server doesn't send/understand yet. This
-   is Fusion's actual real-time state-sync protocol — a substantial
-   separate subsystem, not a small follow-up fix.
-3. Once a **solo host** reaches an actual stable in-game state (not just
-   "didn't disconnect"), figure out what minimal continuous `101` traffic
-   is needed to keep the session alive.
-4. Only after that does implementing enough of `ReflexiveInfo`/
+1. Craft a real, valid PRUDP-Lite `SYN` packet (12+ bytes: magic `0x80` at
+   byte 0, `type_flags` u16-LE at bytes 8–9 with type nibble `0`=SYN, `id`
+   u16-LE at bytes 10–11, bytes 1–7 still unknown — start with zeros and
+   see if that's tolerated, since it clearly wasn't the magic/type/id
+   fields that made the last test's all-zero packet get rejected) and send
+   it the same way (find the bound port live via `ss -tunap | grep
+   <citron-pid>`, or automate finding it — no sudo/capture needed) to see
+   whether the game accepts it and proceeds normally instead of exiting.
+   If the SYN alone isn't enough, Citron's own `DescribePrudpLite` will
+   show in the log exactly what type/flags/id the response (if any)
+   contains, same diagnostic loop as the code-100/101 work — iterate from
+   there. Bytes 1–7's real meaning (and whatever a real CONNECT/DATA
+   exchange looks like) would benefit from a real Steam capture of Outbound
+   actually reaching another player, the same proven technique used all
+   session, if guessing doesn't converge quickly.
+2. Once the freeze is resolved and a **solo host** reaches an actual stable
+   in-game state (not just "didn't disconnect"), understand event code
+   `101`'s *ongoing* traffic — the relay transport's `Connect`/`Accepted`
+   handshake (implemented today) is only connection setup; real Photon
+   Cloud showed continuous bidirectional `101` events afterward (repeating,
+   growing payloads consistent with tick-based simulation snapshots) that
+   this server doesn't send/understand yet. This is Fusion's actual
+   real-time state-sync protocol — a substantial separate subsystem, not a
+   small follow-up fix.
+3. Only after that does implementing enough of `ReflexiveInfo`/
    `PlayerRefMapping`/`ChangeMasterClient` for a **second** real client to
    actually join become relevant — needs a genuine two-peer test (two
-   Switches, or one Switch + one Steam client, both against our server).
-5. Only after gameplay-level connectivity works for 2+ peers does real
+   Switches, or one Switch + one Steam client, both against our server) —
+   and note a second real peer's own NAT-punch attempt may be exactly what
+   the listen socket above is waiting for in the first place, so this step
+   and step 1 may turn out to be the same problem solved two different ways.
+4. Only after gameplay-level connectivity works for 2+ peers does real
    earlier identity verification become relevant (replacing the current
    accept-all anonymous-LAN stance) — `authbridge`'s role would then either
    get absorbed into this server or stay as a separate verification call it
