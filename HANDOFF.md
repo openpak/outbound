@@ -1193,8 +1193,120 @@ match on an unrelated opcode, not a real command-ID check. Confirmed
 dead end, not abandoned early: getting the real struct out of this
 binary would need proper decompiler-grade analysis (Ghidra/IDA-class
 tooling with real cross-referencing time), not pattern-matching a
-constant. `GetFriendDetailedInfoV3` staying a clean failure is final for
-now.
+constant.
+
+### 2026-08-29 follow-up 3: actually resolved — the real bug was never the struct, it was a missing response word
+
+The RE dead end above turned out to be the wrong target entirely. The
+tell was hiding in plain sight: failing the call outright (never
+returning `ResultSuccess`) *also* stopped the crash, alongside every
+buffer-content variant that returned success. If this were really about
+the per-entry struct layout, only *some* success-path contents should
+have crashed, not literally all of them uniformly — the guest was gating
+on the **result code path**, not on what was inside the buffer.
+
+This file's own sibling batch calls that return a variable number of
+entries out of a fixed-capacity buffer (`GetFriendListForViewer`,
+`GetProfileList`) all push an explicit `u32 count` alongside
+`ResultSuccess` (`IPC::ResponseBuilder{ctx, 3}`), for the obvious reason
+that a fixed buffer's own size can't tell the caller how many of its
+slots are actually valid. `GetFriendDetailedInfoV3` takes no id list
+(only a single `Uid` + `NetworkServiceAccountId`) but still writes into a
+300-slot buffer — it needs that same count scalar for the same reason,
+and every attempt so far had only pushed `{ctx, 2}` (Result only, no
+count). A missing count reads as an uninitialized/garbage stack value on
+the guest side, which explains exactly the "walks off into billions of
+bytes, unbounded" read/write pattern every crash showed — a missing
+response word, not a wrong struct.
+
+**Fix, confirmed live:** succeed with an honest `count=0` (buffer zeroed,
+no detailed entries claimed) alongside the count word. The Invite Friends
+screen now renders its own real, correct Nintendo empty-state UI —
+*"You can add friends from your user page in the top left-hand corner of
+the HOME Menu."* — instead of crashing. And critically, unlike the
+fail-clean version, **backing out no longer tears down the hosted Photon
+session**: MyPage now treats this as a normal user cancel rather than a
+service error, so it no longer propagates a failure up to Outbound.
+Confirmed live: `fd=0`'s Photon traffic keeps ticking with zero
+disconnects after opening and cancelling Invite Friends. Committed in
+`earlier-citron` (`07a3fc675`).
+
+**What's still open:** your real earlier friend still won't *appear* in
+that picker — `count=0` is honest but doesn't surface real data, since
+the per-entry struct for a non-zero count is still unconfirmed (the
+`FriendInvitationInviteeCountMax=16`/system-applet findings from the two
+follow-ups above still stand — that data genuinely isn't in Outbound's
+binary, and the system-firmware RE attempt is still a real dead end for
+*that specific question*). But the crash/session-teardown blocker driving
+today's whole investigation is resolved — solo hosting now survives
+Invite Friends being opened and cancelled, which is what was actually
+blocking forward progress through the game's flow.
+
+### 2026-08-29 follow-up 4: real earlier data forwarded, full flow reaches a real "Invitation sent"
+
+Once the crash was actually fixed (not just contained), the natural next
+step was forwarding real data instead of an honest `count=0`:
+`Common::OpenPakFriends::Get()` — already correctly powering
+`GetFriendCount`/`GetFriendListForViewer` — is the same cache this file's
+`MakeFriend()` helper already knows how to convert to `FriendImpl`. Doing
+that immediately surfaced your real friend as a selectable tile (count=1,
+confirmed live), but with no avatar/name/online-status — a narrower,
+more precise version of the "real struct layout" question than before.
+
+Live testing this pinned it exactly: MyPage's own follow-up calls
+(`GetFriendProfileImage`, `GetFriendDetailedInfoV2`) were reading a
+**zero Uid** out of the buffer we wrote, even with `FriendImpl` at
+offset 0 within each 544-byte entry — proof the real struct's Uid field
+isn't at offset 0, even though whatever makes the tile itself
+selectable does line up. Pushed the RE further with a much more precise
+target than command 20108 (a generic-and-noisy server-side dispatch
+constant): searched for `GetFriendProfileImage`'s real command ID
+(10110, `0x277e`) as an immediate in MyPage's own compiled code and got
+exactly **one** hit — a clean, real proxy-stub tail-call table (Nintendo
+SDK auto-generated trampolines, one tiny function per command, each
+loading its command ID then jumping to a shared IPC-send helper).
+Confirmed the stub dereferences a pointer for 16 bytes as the Uid
+argument, but the stub itself is called only *indirectly* (through a
+vtable slot, not a direct `bl`) — found its one reference in `.data`
+(consistent with a vtable entry) but tracing back to the actual call
+site (which struct field gets passed as that pointer) needs full
+class/vtable reconstruction, genuinely decompiler-grade work (Ghidra/IDA
+with real time invested), not something achievable by pattern-matching
+raw bytes with `capstone`.
+
+Rather than guess a third exact offset blind, tried a cheap two-guess
+hedge instead: write `FriendImpl` at **both** offset 0 (original guess:
+32 trailing pad bytes) and the tail-aligned offset `entry_stride -
+sizeof(FriendImpl)` (alternate guess: 32 leading header bytes) within
+each entry — free to test, no extra RE needed. **Confirmed live this
+unlocked real forward progress**, even though the Uid read is still
+apparently wrong (avatar/name still don't render): a new **"Y View
+Details"** button appeared that wasn't there before, leading to a real
+details screen (showing a `When You Became Friends: 31/12/1999 00:00`
+field — Nintendo's network epoch starts 2000-01-01, so this is a zeroed
+field we don't populate rendering as one day before epoch, confirming
+the real struct genuinely has more fields than `FriendImpl` models) with
+a real **Invite** button (`Invitations remaining: 3`), which reached the
+friend picker with the tile actually selectable (`1/3`, checkmark) and
+**"Next" -> a real send that completed with "Invitation sent"**.
+
+The session then disconnected with the same generic "connection
+interrupted" error as earlier follow-ups — **expected, not a
+regression**: `SendFriendInvitation` is still a plain stub with zero
+real delivery (no NPNS-equivalent push to leia's account exists yet), so
+Outbound waiting for some response that will never arrive and eventually
+giving up is exactly what a missing invitation-delivery pipeline should
+look like. This is the "presence-based join" / real-delivery work
+already scoped further up this document — not a new bug to chase.
+
+Committed in `earlier-citron` (`eed426e61`). Current state: the
+crash/session-teardown blocker is fully resolved, real earlier friend
+data flows all the way through to a completed send, and the two
+remaining gaps are both already-scoped, separate pieces of future work:
+(1) the exact Uid/name/avatar field offsets inside the real 544-byte
+struct (needs decompiler-grade RE of MyPage, not more guessing), and
+(2) actual invitation delivery to a second real peer (needs the
+presence-based join work, or a real NPNS-equivalent push pipeline).
 
 ## Security and repository rules
 
