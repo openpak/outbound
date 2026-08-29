@@ -1,8 +1,8 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-08-28 (self-hosted server: GetRegions + encryption fix +
-alt port implemented; cross-tested against Outbound on Steam — real Steam
-auth succeeds cleanly, but a still-unidentified 13-byte packet to the Master
+Last updated: 2026-08-29 (Fusion SDK decompiled — found it layers its own
+session-negotiation protocol + a separate raw-UDP transport with NAT-punch/
+STUN on top of classic Photon; the still-unidentified 13-byte packet to Master
 server blocks the connection on both Steam and Switch)
 
 ## Objective
@@ -432,20 +432,120 @@ documentation of this packet shape.
 - Steam: `echo "127.0.0.1 ns.photonengine.io" | sudo tee -a /etc/hosts`,
   launch Outbound normally, **remove the hosts line afterward**.
 
+### Fusion SDK research: architecture is bigger than "GpBinary relay"
+
+The official Photon Fusion 2.1.2 Unity SDK (`photon-fusion-2.1.2-stable-2279`,
+downloaded from `photonengine.com/en-US/Realtime/Download` after logging in;
+requires a Photon account — not redistributed, kept locally only, at
+`~/Downloads/photon-fusion-2.1.2-stable-2279`) ships real managed .NET
+assemblies that load and run directly on plain .NET 8 (no Unity runtime
+needed): `PhotonLibs/netstandard2.0/release/PhotonClient.dll` (the classic
+Photon Realtime client — real `Protocol16`/`Protocol18` GpBinary codec
+classes, namespace `Photon.Client`) and `Fusion/Assemblies/{Fusion.Runtime,
+Fusion.Sockets}.dll` (Fusion's own layer on top). Decompiled locally with
+`ilspycmd` (`dotnet tool install -g ilspycmd`) for read-only research; the
+DLLs and decompiled output are **not** committed anywhere (copyrighted SDK
+material — kept under `~/photon-oracle/`, gitignored by being outside any
+repo).
+
+**Key finding: Fusion layers its own session-negotiation protocol on top of
+classic Photon**, registered via `RegisterProtocolMsg`:
+
+| Code | Message | Purpose (from decompiled source) |
+|---|---|---|
+| 1 | `Join` | |
+| 2 | `NetworkConfigSync` | |
+| 3 | `ReflexiveInfo` | Carries `ActorNr`, `PublicAddr`, `PrivateAddr`, `NatType` — exchanged so peers/server can attempt NAT punch-through |
+| 4 | `Disconnect` | |
+| 5 | `Start` | Session start; carries `StartRequests` flags incl. `WaitForReflexiveInfo`, `ConnectToShared`, `CustomPlugin` |
+| 6 | `Snapshot` | |
+| 7 | `HostMigration` | |
+| 8 | `PlayerRefMapping` | |
+| 9 | `ChangeMasterClient` | |
+| 10 | `DummyTrafficSync` | |
+
+These are sent as **classic Photon `RaiseEvent`** calls: `SendPackage(100,
+targetActor, reliable, buffer, len)` → `RealtimeClientExtensions.SendEvent`
+→ ordinary `OpRaiseEvent` with event code `100` ("protocol package"; `101`
+is raw passthrough data, `102` is dummy-traffic/keepalive), `CustomEventContent`
+= the serialized Message. So implementing this exchange is realistic within
+our existing `MasterServerHandler`/`GameServerHandler` (already relay
+`RaiseEvent`) — **but only after a room is actually created/joined**, since
+`RaiseEvent` needs a joined room/game context.
+
+**The problem: the mystery Master-port packet fires far too early for this.**
+Timing evidence (both the Steam test runs): the client's first datagram to
+the Master address lands **within ~6-30ms of `GetRegions` succeeding** — long
+before any `Authenticate`/`CreateGame`/`JoinGame` operation is even attempted
+on that connection (in the `--trace` run, real `OpAuthenticate` only
+succeeded ~10+ seconds later, on a *different* reconnect to the alt port).
+This packet cannot be the `Start`/`ReflexiveInfo` RaiseEvent exchange above —
+there's no room yet for `RaiseEvent` to target. It must be something earlier
+and separate.
+
+**Leading (unconfirmed) theory: Fusion's own raw transport layer
+(`NetPeerGroup`), not classic Photon at all.** `Fusion.Sockets.dll` contains
+an entirely separate low-level reliable-UDP implementation — `NetPeerGroup`/
+`NetConnection`/`NetCommands`/a 32-byte `Header` struct with sequence/ack/
+fragment fields, `NetPacketType` enum (`V2=250, Command=1, UnreliableData=2,
+Unconnected=5, MtuDiscoveryReq=6, MtuDiscoveryRep=7, NotifyReliableData=8`),
+plus a built-in STUN client (`StunClient`, real `STUN_MAGIC_COOKIE` constant)
+and NAT-punch state machine (`NATPunchStage`: `Local → Public → Relay`,
+gated by `IsNATPunchthroughEnabled`). This looks like Fusion's *own* game/
+relay-server transport, independent of the classic PUN-style Master/Game
+two-hop dance our server (forked from a PUN game) implements. Unconfirmed
+whether the captured 13-byte packet (`7D×12` + 1 varying byte) is one of
+these — none of `NetPacketType`'s enum values (1/2/5/6/7/8/250) matches
+`0x7D` as a first byte in plaintext, so if this is `NetPeerGroup` traffic
+it's likely either obfuscated/XORed (the STUN client's own real messages
+have a distinct, different, well-documented header — this isn't a STUN
+message) or something not yet located in the decompiled surface (possibly
+native — `NativeSocket`/`_nativeSocket`/`NetSocketNative` strings suggest
+part of this layer may not even be managed IL Unity can decompile).
+
+**What's ruled out:** our server already handles this packet as gracefully
+as a generic implementation reasonably can — `PhotonHeader.ReadFrom` doesn't
+validate anything, so 13 bytes of `0x7D` gets parsed as a header claiming
+`CommandCount=125`, but the command-parsing loop's bounds check
+(`offset + NCommand.HeaderSize <= datagram.Length`) never executes even once
+against a 13-byte total datagram, so zero commands are extracted and nothing
+happens — no crash, no reply, matching exactly what was observed. There is
+no bug to fix here; the packet is real client behavior our protocol
+implementation doesn't recognize, not a parsing defect.
+
+**What would actually resolve this:** a genuine packet capture of a
+*working* Outbound (Steam) session against real, unredirected Photon Cloud,
+compared byte-for-byte against our captures at the same stage. This needs
+`sudo tcpdump` (confirmed this session — plain `tcpdump -i lo` fails with
+`CAP_NET_RAW may be required` for this user) and a live play session, so it
+needs the user's hands-on involvement (running the capture themselves,
+launching the game) — not something continuable unattended. Suggested
+command once ready:
+```sh
+sudo tcpdump -i lo -w outbound-real-photon.pcap 'udp and (port 5058 or port 27000 or port 5055)'
+```
+Remove the `/etc/hosts` redirect first so traffic actually reaches Photon
+Cloud, launch Outbound, try Multiplayer, stop the capture, then diff the
+Master-hop bytes against `docs/research.md`'s existing captures.
+
 ### Next step
 
-Identify the Master-port packet. Either: find independent documentation/
-source of this exact shape, get the official Photon .NET SDK (needs a
-Photon account login — `photonengine.com/en-US/Realtime/Download` — to run
-this codebase's existing but never-yet-used oracle test harness in
-`BlackIce.Photon.Tests`, which would validate the whole wire codec against
-the real library, not just this one packet), or find a Photon Fusion/
-Realtime PC game with source or a debug/verbose logging mode that shows
-what this exchange is meant to accomplish. Only after this resolves does
-real earlier identity verification become relevant (replacing the current
-accept-all anonymous-LAN stance) — `authbridge`'s role would then either
-get absorbed into this server or stay as a separate verification call it
-makes internally.
+1. Get a real-Photon-Cloud packet capture (above) to identify the mystery
+   packet definitively.
+2. Once identified: implement whatever it actually requires (most likely
+   either responding to it directly, or telling the client — via some
+   earlier response field we're not yet setting correctly — not to expect
+   this path at all).
+3. Only after the Master-hop connects does implementing the `Start`/
+   `ReflexiveInfo` RaiseEvent exchange (table above) become relevant — that
+   requires a room to exist first (`CreateGame`/`JoinGame`, already partially
+   implemented for Black Ice/PUN in `MasterServerHandler`/`GameServerHandler`,
+   but never tested against a Fusion client).
+4. Only after gameplay-level connectivity works does real earlier identity
+   verification become relevant (replacing the current accept-all
+   anonymous-LAN stance) — `authbridge`'s role would then either get
+   absorbed into this server or stay as a separate verification call it
+   makes internally.
 
 ## Security and repository rules
 
