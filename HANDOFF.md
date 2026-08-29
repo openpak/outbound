@@ -3,20 +3,17 @@
 Last updated: 2026-08-29 (classic Photon LoadBalancing AND Fusion's session
 bootstrap (Join/Confirmation/NetworkConfigSync/Start/relay Connect-Accepted)
 all now work end-to-end, ground-truth-verified byte-for-byte against a real
-Photon Cloud capture — AND a genuine Citron socket-emulation bug found and
-fixed (earlier-citron) that was corrupting a socket Fusion needs. With both
-fixed, the session no longer errors or disconnects at all — it hangs
-instead. Root cause fully diagnosed live via gdb: a second UDP socket
-blocks forever in `recvfrom()` waiting for a peer that never arrives in
-this redirected, no-second-peer setup, and the game's main thread depends
-on it, so every guest CPU core goes idle — a genuine full freeze. Confirmed
-live by sending the blocked socket a single arbitrary UDP packet from the
-host while frozen: the freeze immediately resolved (proving the diagnosis
-exactly), though the game then cleanly exited since the packet wasn't
-valid data. The socket turns out to speak Nintendo's own **PRUDP-Lite**
-P2P transport (not Fusion's own protocol) — Citron already has a header
-decoder for it, giving everything needed to craft a real packet next. This
-is the current, precisely-located wall; not yet fixed.)
+Photon Cloud capture. The full-freeze bug documented below (a second UDP
+socket blocking forever in `recvfrom()`) is **fixed and confirmed live**:
+the real cause was `SocketImpl` stripping Horizon's `SOCK_NONBLOCK` flag
+without applying its semantics, turning Fusion's intended nonblocking poll
+into a blocking call. A real Switch + Citron + OpenPak session now hosts
+with no freeze. The current wall is the in-game **Invite Friends** flow —
+three real citron HLE bugs found and fixed there today too (see "2026-08-29
+live control: freeze confirmed fixed" below), but the native invite applet
+itself needs an undocumented firmware-20.0.0 struct we don't have a
+confirmed layout for; a presence-based join alternative that avoids it
+entirely is scoped, not yet started.)
 
 ## Objective
 
@@ -879,6 +876,95 @@ implemented in Citron, so this is read from real code, not guessed):
 
 ### Next step
 
+#### 2026-08-29 live control: Nintendo/OpenPak endpoint hypothesis ruled out
+
+The possibility that the freeze was caused by missing Nintendo/NEX/OpenPak
+endpoint information was tested directly. Citron was restarted with both
+`OPENPAK_ENABLE=1` (enabling its Nintendo/NAT DNS redirects) and
+`OPENPAK_PHOTON_IP=127.0.0.1`. Hosting froze in exactly the same place. The
+complete DNS trace for the run contained only `ns.photonengine.io`; Outbound
+did not request an `nncs`, Nintendo, NEX, or NAT-check hostname, so there was
+nothing for the Reference Nintendo/NAT redirect to supply. The same separate
+unconnected UDP socket appeared alongside the healthy connected Photon socket.
+
+This also corrects an over-strong earlier interpretation: Citron's
+`DescribePrudpLite` output only classifies the bytes injected by the diagnostic
+probe when their header matches that decoder. It does not prove the game asked
+Nintendo/NEX for a PRUDP service. The socket was created by Fusion's native UDP
+transport path, and all observed service discovery remains Photon-only.
+
+The strongest next emulator-side hypothesis is now loss of socket creation
+semantics. Outbound creates the native UDP socket with type value
+`0x30000002`. Citron currently strips `0x20000000` and `0x10000000` as unknown
+flags before translating the remaining `SOCK_DGRAM`, but does not preserve any
+behavior associated with either bit. The resulting host socket is blocking;
+the guest calls `recvfrom()` without `MSG_DONTWAIT` or a receive timeout and
+Citron blocks literally in libc. One or both high bits may encode Nintendo's
+socket-level nonblocking/close-on-exec creation flags. Test this by mapping the
+appropriate creation bit to `SetNonBlock(true)` and the descriptor's
+`FLAG_O_NONBLOCK`, then rebuild Citron and repeat Host Session. This explains
+both prior states: leaving `0x10000000` in the base type produced `EBADF`, while
+blindly stripping it made the socket valid but potentially changed an intended
+polling receive into a permanent blocking receive.
+
+**Confirmed immediately afterward from libnx's Horizon BSD headers:** these
+bits are not unknown. `SOCK_CLOEXEC = 0x10000000` and
+`SOCK_NONBLOCK = 0x20000000`, documented as creation flags OR'ed into the
+`socket()`/`socketpair()` type argument. Thus `0x30000002` means exactly
+`SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK`. This proves the freeze's direct
+Citron cause: `SocketImpl` removed the nonblocking bit without applying its
+semantics, so Fusion's intended nonblocking `recvfrom()` poll became a blocking
+libc call.
+
+**Citron fix applied and building:** in
+`earlier-citron/src/core/hle/service/sockets/bsd.cpp`, `SocketImpl` now:
+
+- records whether `SOCK_NONBLOCK` (`0x20000000`) was present before stripping
+  creation flags from the base type;
+- treats `0x10000000` as `SOCK_CLOEXEC` (no separate action is needed for
+  Citron's emulated descriptor table);
+- after socket initialization, calls `SetNonBlock(true)` and stores
+  `Network::FLAG_O_NONBLOCK` in `descriptor.flags`;
+- fails socket creation cleanly if enabling nonblocking mode fails.
+
+The incremental `ninja -C build/use-nopgo citron` rebuild was in progress when
+this note was written. Next: launch this build with the normal Photon prefix,
+Host Session, and verify that the extra UDP socket's empty `recvfrom()` returns
+`EAGAIN` instead of freezing. Do not inject synthetic PRUDP packets during this
+test; they would obscure whether the socket semantics fix alone resolves it.
+
+#### New live result after the handoff was written: PRUDP packets advanced the client, exposing an eNet type-11 drop
+
+A subsequent live retry refined the blocker substantially:
+
+- The first valid-looking PRUDP-Lite `SYN` released the blocked `recvfrom()` without
+  the earlier immediate `ForceStop`, but the client then blocked on a second receive.
+- The sender socket from the first attempt had already closed, so it could not participate
+  in a continuing exchange. A persistent socket was used for the next attempt.
+- Sending `SYN` followed by `CONNECT` from that same socket caused the game to advance and
+  immediately send a new 183-byte classic-Photon packet to the self-hosted Game server.
+- The client retransmitted the same event-code-101 `OpRaiseEvent` three times over roughly
+  40 seconds. The server logged each datagram as `RECV`, but never logged the normal
+  `<- OpRaiseEvent` application-level line or sent the relay `Accepted` reply.
+
+The server-side cause is now confirmed from the packet and source, and is independent of
+PRUDP parsing: the application message is carried in eNet command type **11**
+(`SendUnsequenced`), with a 16-byte eNet command header and a 167-byte Photon payload.
+`NCommand.Parse` already recognizes type 11 and extracts its payload correctly, but
+`EnetPeer.HandleCommand` only returns application payloads for `SendReliable` (6),
+`SendUnreliable` (7), and `SendFragment` (8). It has no `SendUnsequenced` case, so the
+167-byte payload is silently discarded before `PeerConnection.HandleAppPayload`, GpBinary
+decoding, or `GameServerHandler.HandleRaiseEvent` can run. This precisely explains the raw
+`RECV` entries with no matching operation log.
+
+The immediate server fix in `~/REPOS/earlier-photon` is to surface
+`NCommand.SendUnsequenced` payloads in `EnetPeer.HandleCommand`, treat them as an unreliable
+inbound delivery for relay purposes, and add regression coverage. Then repeat the live
+`SYN` + `CONNECT` stimulus with the sender socket kept open. The existing event-101 handler
+should finally receive the `NetCommandConnect` and return its already-implemented
+`NetCommandAccepted`; the next client state will show whether the PRUDP side needs another
+handshake packet or whether the relay acceptance is sufficient.
+
 1. Craft a real, valid PRUDP-Lite `SYN` packet (12+ bytes: magic `0x80` at
    byte 0, `type_flags` u16-LE at bytes 8–9 with type nibble `0`=SYN, `id`
    u16-LE at bytes 10–11, bytes 1–7 still unknown — start with zeros and
@@ -916,6 +1002,112 @@ implemented in Citron, so this is read from real code, not guessed):
    get absorbed into this server or stay as a separate verification call it
    makes internally.
 
+### 2026-08-29 live control: freeze confirmed fixed, three new Invite Friends bugs found and fixed
+
+The `SOCK_NONBLOCK` fix from the previous section (preserving `0x20000000`
+instead of stripping it, and actually calling `SetNonBlock(true)`) is
+confirmed live: a real Switch + Citron + OpenPak session now hosts
+successfully with **no freeze at all**. The wall this session hit next was
+the in-game **Invite Friends** flow, which repeatedly froze/crashed —
+unrelated to Fusion or the Reference backend, all three root causes were
+plain citron HLE gaps:
+
+1. **`IDisplayController::GetLastApplicationCaptureImageEx` (cmd 6) was
+   `nullptr`.** The friend-invitation card wants a captured screenshot;
+   hitting the unimplemented-function fallback left the IPC response
+   malformed, which the guest's own fault handler escalated into a fatal
+   CMIF/panic path — a genuine freeze, not just a cosmetic crash log. Fixed
+   by stubbing it the same way its sibling `GetCallerAppletCaptureImageEx`
+   already was (`out_was_written = false`, honest "no capture" answer).
+2. **`IFriendService`'s command **20108** (added in firmware 20.0.0, real
+   name unconfirmed, called `GetFriendDetailedInfoV3` here) had no case at
+   all**, which sent Outbound into the system Error applet (a genuine HOS
+   error screen, "CMIF 212... likely an unimplemented applet spawn").
+3. **Once 20108 had *a* handler, every content tried for its 0x800+-byte
+   MapAlias output buffer corrupted the guest**, confirmed across four
+   separate live attempts: writing this file's own `FriendImpl` struct
+   (guest walked off into unmapped reads past our short data — the guest
+   always allocates exactly `MaxRequestedIds`=300 entries here, i.e. this
+   is a *batch* candidate-list call like `GetFriendDetailedInfoV2`, just
+   against a real per-entry struct 0x220/544 bytes wide, not `FriendImpl`'s
+   0x200/512); leaving the buffer untouched (HIPC does not guarantee it
+   arrives zeroed — the guest read back live heap garbage as a pointer and
+   wrote through it forever, "Unmapped Write64 @ 0x0" looping); an all-zero
+   fill sized to the guest's own allocation (still glitched into a garbled
+   framebuffer, then froze); one real friend entry written at the computed
+   544-byte stride, assuming `FriendImpl`'s layout holds for the leading
+   bytes of the real struct (same corruption — that assumption is wrong).
+   **Final fix: fail the call outright** (`Result{ErrorModule::Friends, 1}`,
+   arbitrary non-zero code) and never touch the buffer. The guest's own
+   success check — which every content-based attempt above skipped past,
+   since they all returned `ResultSuccess` — is what actually gates whether
+   it reads the buffer at all. This resolves cleanly to the game's own
+   generic system error dialog (`Error Code: 2121-0001` — confirms the
+   on-screen code format is exactly `(2000+module)-(description)`) instead
+   of a freeze or corrupted framebuffer, and the hosted Photon session
+   survives it untouched (confirmed live: `fd=0` keeps ticking fine both
+   before and after the error dialog).
+
+All three fixes are committed in `earlier-citron`
+(`9ad10b0a7`).
+
+**A separate, non-citron finding from the same testing**: exiting the
+Invite Friends screen — by any means tried (Back, or dismissing the
+20108-triggered error) — makes Outbound itself send an explicit Photon
+`Disconnect` command and tear down the *entire* hosted session, which is
+what actually produces the player-facing **"connection interrupted
+(1020)"** message. This happened identically regardless of what citron
+returned for 20108, so it isn't a citron bug: Outbound appears to be
+waiting for a real end-to-end friend-invitation delivery (see next
+section) and gives up on the whole session when that never happens,
+using its generic disconnect message for any session end, not
+specifically for an error.
+
+### Recommended next direction: skip the native Invite Friends applet, use presence-based join instead
+
+The **Invite Friends** system applet is Nintendo's own LLE code (real
+firmware, not something citron reimplements) reading from `IFriendService`
+calls including firmware-20.0.0-only ones like 20108 that have **no public
+documentation** — every attempt to synthesize plausible data for it
+corrupted the guest, and pinning the real struct layout would need a
+genuine packet capture of real hardware exercising this exact flow
+(camera/screenshot data included), a much bigger ask than the Steam
+cross-test technique used earlier in this project for the classic Photon
+flow.
+
+`web_service/legacy_api.cpp`/`.h` already has a **complete, working,
+simpler alternative** that sidesteps the whole native-invite-applet
+problem: `PushPresence(status, app_field, app_id, app_name)` publishes an
+opaque per-title `app_field` blob (intended to carry the joinable-session
+info — the Fusion room code, in Outbound's case) alongside online/in-game
+status, and `GetFriends()` already returns each friend's own `app_field`
+back out. This is the standard "friend sees you're in a joinable game and
+joins from their own friends list" model — no NPNS-style push, no
+`PushToFriendInvitationStorageChannel`/`SendFriendInvitation` round trip,
+and it only touches calls already proven working and well-understood in
+this codebase (`GetFriendCount`, `GetFriendListForViewer`,
+`GetFriendDetailedInfoV2`, `UpdateFriendInfoForViewer` — all confirmed
+live and documented above/in `friend.cpp`'s own comments).
+
+Scoped next steps for this direction, not yet started:
+1. Confirm what Outbound actually writes into its own presence `app_field`
+   when hosting (needs a live capture the same way App ID/GetRegions were
+   recovered earlier this project — likely contains the Fusion room code
+   and maybe `scene`/`vehicleType` from the room properties already seen
+   in the classic-Photon `OpJoinGame` trace).
+2. Wire `Common::OpenPakFriends::SetLocalPresence`/
+   `TakeLocalPresenceForPublish` (already exist, see
+   `common/legacy_friends.h`) through to `legacy_api.cpp::PushPresence`
+   for Outbound specifically, if not already generic across all titles.
+3. On the joining side, surface a friend's joinable presence somewhere
+   reachable without the native Invite Friends applet — most likely
+   citron's own OpenPak-menu UI (`src/citron/legacy_*`), not a HOS
+   system applet, sidestepping the undocumented-struct problem entirely.
+4. Only if this path proves insufficient (e.g. Outbound's own UI hard-
+   requires the native invite flow to complete before it considers a
+   session real) does reverse-engineering 20108's real struct via a
+   genuine hardware/Steam capture become necessary.
+
 ## Security and repository rules
 
 - Never commit `openpak_account.txt`, session tokens, BAAS tokens, keys,
@@ -937,4 +1129,3 @@ implemented in Citron, so this is read from real code, not guessed):
   <https://doc.photonengine.com/realtime/v5/realtime-intro>
 - earlier network:
   <archived external source>
-
