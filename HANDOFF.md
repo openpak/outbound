@@ -1,11 +1,14 @@
 # Outbound Reference — development handoff
 
 Last updated: 2026-08-29 (classic Photon LoadBalancing AND Fusion's session
-bootstrap (Join/Confirmation/NetworkConfigSync/Start) both now work
-end-to-end for a real Switch client, ground-truth-verified byte-for-byte
-against a real Photon Cloud capture; new confirmed blocker is Fusion's
-real-time state-sync protocol, event code 101 — a substantial separate
-subsystem, not yet started)
+bootstrap (Join/Confirmation/NetworkConfigSync/Start/relay Connect-Accepted)
+all now work end-to-end, ground-truth-verified byte-for-byte against a real
+Photon Cloud capture — AND a genuine Citron socket-emulation bug found and
+fixed (earlier-citron) that was corrupting a socket Fusion needs and
+crashing/hanging every Switch session before this point. Current session now
+survives 25+ seconds with no error, longer than any prior attempt; new
+mystery is a discrepancy between what Citron's own log reports and what our
+server actually receives — needs careful investigation, not yet understood)
 
 ## Objective
 
@@ -699,56 +702,121 @@ is the full extent of what "Fusion session bootstrap" means at the protocol
 level, and it now works end-to-end, verified byte-for-byte against ground
 truth, not just "stopped erroring."
 
-### Current confirmed blocker: Fusion's real-time state-sync protocol (event code 101)
+### Fusion's relay transport handshake (event code 101, Connect/Accepted): implemented
 
-Even with a byte-perfect `Start`, the client still disconnects shortly after
-(~120ms) — but the *reason* is now understood precisely, from the same real
-Steam capture: immediately after receiving `Start`, the real client sends
-its own message on a **different** event code — `101` ("DATA", not `100`
-"protocol package") — whose payload's tail exactly matches the server's own
-`UniqueId` bytes echoed back (`98 0c e9 ba a7 28 63 7b`, confirmed
-byte-for-byte against the `Confirmation` we decoded). The real server
-replies **within ~40ms** on that same code-`101` channel, after which real
-simulation-tick data starts flowing continuously in both directions
-(repeating code-`101` events, growing payloads consistent with a tick
-counter).
+Even with a byte-perfect `Start`, the client still disconnected shortly
+after (~120ms) — but the *reason* was pinned down precisely from the same
+real Steam capture: immediately after receiving `Start`, the real client
+sends its own message on a **different** event code — `101` ("DATA", not
+`100` "protocol package"). Unlike code `100` (bit-packed `Fusion.Protocol`
+messages), code `101` carries **raw C `[StructLayout(LayoutKind.Explicit)]`
+struct memory layouts** from `Fusion.Sockets`' `NetPeerGroup`/
+`NetSocketRelay` — Fusion's own separate low-level transport, tunneled
+through classic Photon's `RaiseEvent` when running in relay mode rather than
+using a real socket. Decoded field-for-field by mirroring the exact structs
+(`NetCommandHeader`, `NetCommandConnect`, `NetCommandAccepted`,
+`NetConnectionId`) as local `unsafe` C# types and reading captured bytes
+through them via `MemoryMarshal`/pointer casts — not by hand-counting byte
+offsets, which is fast but error-prone for packed native layouts. The
+client's first `101` message is a `NetCommandConnect` (152 bytes:
+`PacketType=Command`, `Command=Connect`, `TokenLength=0`, and critically a
+**`UniqueId` field that exactly matches the server's own `Confirmation`
+`UniqueId`** — the client is "connecting" to the relay using the identity
+token the server gave it minutes earlier). The real server replies within
+~40ms with a `NetCommandAccepted` (32 bytes: `AcceptedLocalId`=
+`AcceptedRemoteId`={Group=0, GroupIndex=0, Generation=1}, `Counter=1` — a
+self-loopback accept, appropriate for a solo Shared-mode host). Implemented
+as `FusionRelayProtocol` (`BlackIce.Photon`), wired into
+`GameServerHandler.HandleRaiseEvent`; both directions pinned as regression
+fixtures (`FusionRelayProtocolTests`) against the real captured bytes.
 
-Our server sends nothing at all on event code `101`. The client's own
-"ready"/first-tick message gets no reply, and it gives up — this is almost
-certainly a distinct, much shorter timeout specific to this handshake than
-the 120s `StartGameOperation` deadline (the earlier bootstrap-only tests
-without a `Start` message at all failed at exactly 120s; with a correct
-`Start`, failure now happens in ~120ms, an entirely different order of
-magnitude, pointing at a different wait condition).
+**Confirmed live** (Switch/Citron): with this reply in place, the failure
+point moved again — no more instant disconnect after `Start`.
 
-This is Fusion's actual **real-time state synchronization protocol** — not
-part of the one-time session bootstrap at all. It's the mechanism by which
-game/vehicle/physics state actually gets synced between host and clients
-every tick, and is a substantial separate subsystem (tick-based snapshot
-encoding, likely delta-compression, actual game state — not just a
-handshake) rather than a small follow-up fix. This is the natural end of
-today's session's scope.
+### A real Citron bug, found and fixed: corrupted socket blocked all further progress
+
+With the server-side protocol fully correct, the Switch/Citron client still
+never got as far as attempting the relay `Connect` above — it disconnected
+(or, once this bug was fixed, hung) even earlier, before that step. Citron's
+own log (`~/.local/share/citron/log/citron_log.txt`) pinpointed it exactly:
+right after `Start`, the game calls `socket()` a second time (for its own
+NAT-punch/local-UDP attempt, `Fusion.Sockets`' `NetSocketNative`, separate
+from the Photon-relay connection) with **two unknown flag bits set
+simultaneously** in the type field. `earlier-citron`'s
+`BSD::SocketImpl` (`core/hle/service/sockets/bsd.cpp`) already stripped one
+of them (`0x20000000`, added for some earlier game) but not the other
+(`0x10000000`) — the leftover bit survived into
+`Service::Sockets::Translate(Type)`, which has no case for it, hit
+`UNIMPLEMENTED_MSG`'s assertion path, and the socket was left corrupted:
+every subsequent `Bind()`/`Connect()` on that fd failed with `EBADF`
+("Bad file descriptor").
+
+**Fix** (`earlier-citron`, committed): strip `0x10000000` the same way,
+right after the existing `0x20000000` strip, in `BSD::SocketImpl`.
+**Confirmed live**: the socket now creates as a clean `SOCK_DGRAM` and
+`Bind()` succeeds. Rebuilt incrementally (`ninja citron` in
+`build/use-nopgo`, ~15 files relinked, no full rebuild needed).
+
+**Result**: the connection now survives 25+ seconds of steady keepalive with
+**zero errors** — longer than any attempt made at any earlier point in this
+entire investigation (every prior test failed within 30s–120ms with an
+explicit disconnect). This is a qualitatively different, better state than
+anything seen before today's server-side protocol work even started.
+
+### Current confirmed blocker: unexplained discrepancy after the socket fix
+
+The game now appears to hang (no error dialog) rather than disconnect.
+Investigating that surfaced a genuine, not-yet-understood contradiction:
+
+- **Citron's own log** shows what looks like continuing, successful
+  Photon-port traffic (`LogPhotonPacket` TX/RX pairs, `host=ns.photonengine.io
+  peer=…:27002`, regular ~4s Ping/Ack) for 25+ seconds after the new socket
+  binds.
+- **Our server's own `--trace` log**, for the *same* peer/session, shows the
+  client's acknowledgements simply **stop arriving around the same window**
+  — the server's own outgoing keepalive Pings go unanswered and it evicts
+  the peer after its normal 10-second inactivity timeout.
+- Only one Game-server peer connection exists in the server log for this
+  test (no silent reconnect to a new port that would explain the gap), so
+  it isn't simply "a new connection appeared and the old one was correctly
+  abandoned."
+
+Not yet resolved. Plausible directions, none confirmed:
+- Fusion's NAT-punch/STUN attempts (the new raw socket) are almost certainly
+  **not** covered by the `OPENPAK_PHOTON_IP` redirect at all —
+  `GetPhotonRedirectIp` (`sfdnsres.cpp`) only intercepts **hostname**
+  resolution containing `photonengine.io`; a STUN/NAT-punch destination
+  reached by a hardcoded IP (typical for STUN) would go straight to the real
+  internet, unredirected. If that hangs/times out, it might be stalling
+  something that indirectly affects the (correctly redirected) classic
+  Photon connection too, even though the two look independent.
+- `bsd.cpp`'s `LogPhotonPacket` is gated by destination **port** only
+  (`IsPhotonPort`: 5055/5056/5058/27000–27003) — it doesn't distinguish
+  *which* client fd sent a packet, or independently confirm the syscall
+  actually succeeded on the wire vs. only being attempted. Its continued
+  output isn't hard proof the redirected connection is still genuinely
+  alive from the server's point of view.
+- Needs careful, patient investigation (likely: correlate exact wall-clock
+  timestamps between the two logs precisely, or add fd-aware logging to
+  confirm which socket carries which packet) rather than further guessing —
+  this is where today's session stopped.
 
 ### Next step
 
-1. Understand event code `101`'s wire format the same way `100` was solved:
-   capture a real Steam session (same proven technique), and this time also
-   check whether `Fusion.Sockets`/`Fusion.Runtime`'s decompiled source has
-   real classes for whatever's inside a `101` payload (the `100` channel
-   turned out to have a genuine spec in `Fusion.Protocol` — `101`/`102`
-   might too, or might be raw simulation-state bytes with no equivalent
-   documented structure).
-2. Implement enough of a reply to the client's first `101` message (the
-   "ready"/reflexive-echo one, containing the server's own `UniqueId` sent
-   back) to stop it from timing out — this is the next concrete, scoped
-   target, analogous to today's `Join`→`Confirmation` step but one layer
-   deeper.
-3. Once a **solo host** stays connected and reaches an actual in-game state
-   (not just "didn't disconnect"), figure out what minimal continuous
-   `101` traffic (if any) is needed to keep the connection alive — real
-   Photon Cloud showed continuous bidirectional `101` events even for a
-   solo session, so this likely isn't optional even before a second real
-   player exists.
+1. Resolve the Citron-log-vs-server-log discrepancy above before anything
+   else — until it's understood, further protocol work risks being built on
+   a wrong picture of what's actually happening on the wire.
+2. Once the connection is confirmed genuinely stable (not just quiet),
+   understand event code `101`'s *ongoing* traffic — the `Connect`/
+   `Accepted` handshake above is only the relay transport's own connection
+   setup; real Photon Cloud showed continuous bidirectional `101` events
+   after that (repeating, growing payloads consistent with tick-based
+   simulation snapshots) that this server doesn't send/understand yet. This
+   is Fusion's actual real-time state-sync protocol — a substantial
+   separate subsystem, not a small follow-up fix.
+3. Once a **solo host** reaches an actual stable in-game state (not just
+   "didn't disconnect"), figure out what minimal continuous `101` traffic
+   is needed to keep the session alive.
 4. Only after that does implementing enough of `ReflexiveInfo`/
    `PlayerRefMapping`/`ChangeMasterClient` for a **second** real client to
    actually join become relevant — needs a genuine two-peer test (two
