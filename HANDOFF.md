@@ -1108,6 +1108,60 @@ Scoped next steps for this direction, not yet started:
    session real) does reverse-engineering 20108's real struct via a
    genuine hardware/Steam capture become necessary.
 
+### 2026-08-29 follow-up: actually checked whether 20108 is decompileable from Outbound's own binary
+
+Called out (correctly) for asserting the struct behind cmd 20108 was
+"undocumented" without first checking whether Outbound's own compiled code
+— which this project has real precedent decompiling (see `friend.cpp`'s
+existing ARMS/Splatoon 2/3 presence-blob fixups, reverse-engineered from
+their update binaries) — already reveals it. It was checked, thoroughly,
+with real tooling, not just `strings`:
+
+- Extracted the real decrypted `main` NSO for `0100ED9024EB8000` via
+  **Ryujinx's "Extract Data → ExeFS"** (citron has no equivalent feature —
+  only "Dump RomFS" exists in `src/citron/game_list.cpp`). Ryujinx already
+  had the title installed from the earlier save-transfer work.
+- Ran `Il2CppDumper` (`github.com/Perfare/Il2CppDumper`, cloned+built
+  locally with `dotnet build`, not committed anywhere) against that `main`
+  NSO plus the `global-metadata.dat` already in this project's RomFS dump
+  — full success, produced a real `dump.cs` with genuine C# type/method
+  signatures for the entire game, including Nintendo's actual
+  `NintendoSDKPlugin` Unity wrapper for `nn.friends`.
+- Wrote a small NSO segment decompressor (`.text`/`.rodata`/`.data`, raw
+  LZ4 block format, not committed — scratch-only, same status as the
+  `~/photon-oracle` DLL-research convention already established in this
+  doc) and disassembled the native accessor functions (`GetAccountId`,
+  `GetNickname`, `GetPresence`, `IsFavorite`, `IsNewly`, `IsValid`) at
+  their real RVAs with `capstone` (ARM64).
+
+**Result, confirmed from real disassembly, not inference:** every one of
+those native accessors starts with `mov w2, #0x200` before copying the
+managed `nn.friends.Friend` struct — it really is exactly 0x200 (512)
+bytes, an exact independent match for this file's own `FriendImpl`
+(`static_assert(sizeof(FriendImpl) == 0x200)`). This is a genuine,
+welcome confirmation that `GetFriendDetailedInfo`/`V2` (20102/20107)
+already use the right struct — not something this session set out to
+prove, a useful byproduct of checking cmd 20108.
+
+**But cmd 20108's struct still isn't in Outbound's binary, for a real
+reason, not a shrug:** Outbound's own compiled `nn.friends` bindings cap
+`FriendInvitationInviteeCountMax` at **16**, not 300 — nothing in
+Outbound's own code path matches the 300-entry, 544-byte-stride buffer
+the crash showed. Combined with the earlier finding that "Select Friends
+to Invite" is Nintendo's own native system applet UI (not drawn by
+Outbound), this makes sense architecturally: that applet runs as its
+*own* process with its *own* `IFriendService` IPC session and queries it
+directly to populate its own UI — Outbound only launches it
+(`StartSendingFriendInvitation`/`ShowFriendList` in the SDK bindings).
+Command 20108's real caller is Nintendo's system firmware code, which
+lives outside Outbound's game binary entirely, in the console's actual
+system title files — a genuinely different, bigger category of dump than
+a game's own ExeFS (the user's own console's firmware, not the game),
+not something further work on Outbound's binary can reach no matter how
+thorough. Leaving `GetFriendDetailedInfoV3` failing cleanly (see above)
+remains correct until/unless that firmware-side struct becomes reachable
+some other way.
+
 ## Security and repository rules
 
 - Never commit `openpak_account.txt`, session tokens, BAAS tokens, keys,
