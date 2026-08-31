@@ -2293,7 +2293,10 @@ Supporting pieces:
   two instances plus any other citron project (Among Us, CTR, Splatoon tests)
   can push the 29 GB machine into swap-thrash, which has frozen the host
   mid-MyPage-applet-load and forced a reboot. Before launching: `pgrep -x citron`
-  for other instances, `free -h` for headroom, then ask.
+  for other instances, `free -h` for headroom, then ask. ENFORCED IN CODE: both
+  `launch-citron-*.sh` scripts abort if a foreign citron instance (any cwd outside
+  this project's profiles) is running — learned the hard way after launching blind
+  next to a running CTR session.
 
 **Not yet live-tested.** The watch-points for the first run, all in citron's log
 (`~/.local/share/citron/log/citron_log.txt` for the host, the joiner's own for the
@@ -2355,3 +2358,12 @@ barrier repair) applies to joining too, the joiner's save may need it done once.
   (title-specific `OPENPAK_*` vars).
 - Never broad-`pkill` citron patterns: they match the calling shell
   itself and other titles' instances.
+
+### Kills: target by game, never by binary path (incident 2026-08-31)
+
+A binary-path kill (`pkill -f earlier-citron/build`) terminated a
+running Outbound session on the shared machine. When killing a citron
+instance, kill ONLY pids whose cmdline contains THIS project's game
+NSP path (check /proc/<pid>/cmdline per pid). When any other title's
+instance is running, ask before launching or killing anything — memory
+pressure alone (29 GB host) can OOM a foreign session.
