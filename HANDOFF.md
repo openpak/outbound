@@ -1,19 +1,17 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-08-29 (classic Photon LoadBalancing AND Fusion's session
-bootstrap (Join/Confirmation/NetworkConfigSync/Start/relay Connect-Accepted)
-all now work end-to-end, ground-truth-verified byte-for-byte against a real
-Photon Cloud capture. The full-freeze bug documented below (a second UDP
-socket blocking forever in `recvfrom()`) is **fixed and confirmed live**:
-the real cause was `SocketImpl` stripping Horizon's `SOCK_NONBLOCK` flag
-without applying its semantics, turning Fusion's intended nonblocking poll
-into a blocking call. A real Switch + Citron + OpenPak session now hosts
-with no freeze. The current wall is the in-game **Invite Friends** flow —
-three real citron HLE bugs found and fixed there today too (see "2026-08-29
-live control: freeze confirmed fixed" below), but the native invite applet
-itself needs an undocumented firmware-20.0.0 struct we don't have a
-confirmed layout for; a presence-based join alternative that avoids it
-entirely is scoped, not yet started.)
+Last updated: 2026-08-31. The joiner-side join trigger has been REBUILT from
+scratch as a clean manufactured guest-call facility (`core/legacy_guest_call`),
+after this session's static disassembly proved the previously-attempted CheckForInvite
+trampoline could never have worked even if it hadn't crashed: `NetworkManager.Join`
+only *constructs* the join coroutine and returns it — nothing ever calls
+`StartCoroutine` on it — and it also (a) copied the raw popped bytes (5-byte header
+included) as UTF-16 and (b) hardcoded one session's ASLR base. The new facility arms
+from the invite-mailbox pop, fires on the Unity main thread at the kernel scheduler
+boundary, chains `Join(code, false)` → `MonoBehaviour.StartCoroutine` (the exact
+two calls StartJoinOnLoad makes), and restores the guest context — no hand-assembled
+code, no mid-function frame assumptions, runtime-base-aware throughout. Not yet
+live-tested. See "2026-08-31" below for the full session.)
 
 ## Objective
 
@@ -1308,6 +1306,1016 @@ struct (needs decompiler-grade RE of MyPage, not more guessing), and
 (2) actual invitation delivery to a second real peer (needs the
 presence-based join work, or a real NPNS-equivalent push pipeline).
 
+### 2026-08-30: correction on Fusion relay scope, random-matchmaking dead end, and a real presence-based join path (bypasses the applet struct wall entirely)
+
+Three findings today, none requiring more struct RE:
+
+**1. Fusion's ongoing state-sync is very likely already relayed correctly.**
+Earlier docs in this file (see `FusionRelayProtocol`) treated Fusion's
+in-room simulation traffic (event 101, `UnreliableData`) as "a substantial
+separate subsystem, not a small follow-up fix." That was wrong. Checked
+`earlier-photon`'s `GameServerHandler.cs`: the generic
+`_registry.Session(state.RoomName).RelayFrom(state.Actor, new EventData(ec,
+...), peer.CurrentInboundUnreliable)` call runs unconditionally for every
+event code, not just the specially-handled 100/101 handshake — and
+`RelayFrom` (`RoomSession.cs`) is a plain room-wide broadcast, generic over
+event code. The server doesn't need to understand Fusion's internal bit-
+packed simulation format at all; it only needs to move bytes between two
+real game clients that already understand each other. Ongoing gameplay
+sync should already work once two real peers are in the same room — not
+independently verified live yet (needs an actual two-peer join, see below),
+but no code work is expected to be required here.
+
+**2. Random/public matchmaking is a confirmed dead end, checked properly
+this time.** Grepped Outbound's own IL2Cpp dump for `JoinRandomRoom`/
+`OpJoinRandomRoom`: every hit (`LoadBalancingClient`, `LoadBalancingPeer`,
+the `*Async` extension helpers) lives in Photon's own generic `Realtime`
+SDK assembly — boilerplate present in every Photon-based game regardless
+of whether that game's own code ever calls it. Outbound's *own*
+game-specific networking abstraction (`Huey.Core.Runtime.Networking.
+ISessionHandler`/`SessionHandlerBase<PlatformDataType, UserType>`) only
+exposes `CreateSession`/`JoinSession`/`ChangeSessionVisiblity`/
+`RetrieveCurrentPlayerList`/`SendSessionInvite`/`LeaveSession` — no
+"join random"/"find sessions"/"browse lobby" concept anywhere in Outbound's
+own abstraction. `JoinSessionRequest` (the concrete request `JoinSession`
+takes) is just `{SessionID: string, JoinAllLocalUsers: bool}` — an opaque
+ID, not a query. The concrete Switch implementation is `NetworkSystemSwitch
+: NetworkSystemBase`. Conclusion, with actual evidence this time (unlike
+the earlier Steam Enter-Code mistake): Outbound never offers public
+matchmaking on any platform, Switch included, by its own design — only
+friend-hosted sessions via a `SessionID` obtained through
+`SendSessionInvite`. This is a real, checked dead end, not "not found yet."
+
+**3. `SendSessionInvite` on Switch is exactly the native Invite Friends
+applet already RE'd to its dead end** — `NetworkSystemSwitch`'s
+`SendSessionInvite`/`JoinSession` are standard Nintendo SDK bindings that
+launch/consume the system Friend applet (MyPage,
+`0100000000001013`), the same LLE code this file already spent two full
+follow-ups RE'ing to a genuine dead end (the per-entry struct's real Uid/
+name/avatar offsets need real hardware or Steam packet capture, not more
+static analysis of either Outbound's or MyPage's binary). Outbound has no
+alternate, own-code invite path to fall back to — this fully confirms
+(rather than just recommends) that presence-based join, already scoped as
+"Recommended next direction" further up this document, is not just an
+alternative but the *only* viable path forward that doesn't require real
+hardware.
+
+**Presence-based join: the missing wire was found and connected, no
+network/protocol work needed.** Checked what already existed against the
+three scoped steps from the "Recommended next direction" section:
+
+- Step 1 (confirm what Outbound writes into presence `app_field`) and
+  step 2 (wire the publish path) turned out to be **already done**, just
+  not documented as such: `IFriendService::UpdateUserPresence` (10610,
+  real HOS call, Outbound calls this itself while hosting) already forwards
+  into `Common::OpenPakFriends::SetLocalPresence`, which `main.cpp`'s
+  `legacy_presence_timer` (5s) already publishes via
+  `WebService::OpenPakApi::PushPresence` whenever it changes. The read
+  side is wired too: `OpenPakApi::GetFriends()`'s `ParseFriend` already
+  base64-decodes each friend's `app_field` back out
+  (`legacy_api.cpp:800-813`), and `OpenPakController::PollFriends()`
+  already caches it into `Common::OpenPakFriends::Entry::app_field`,
+  consumed today live by `MakeFriend()` for the native friends-list
+  presence view. `friend.cpp` already documents the wire format precedent
+  from Splatoon 2/ARMS: a null-delimited key/value scheme (`Mode`/`InGame`
+  for Splatoon 2, `SessionId`/`JoinMode`/`HasPassword` for ARMS) — Outbound
+  presumably uses its own key set from the same
+  `nn::friends::AppKeyValueStorage` mechanism, most likely including its
+  own `SessionID`-equivalent key, though the exact key names haven't been
+  captured live yet (not needed for the fix below, since the blob is
+  carried through opaque either way).
+- Step 3 (surface a friend's joinable presence somewhere reachable without
+  the native applet) was the one real gap, and it's now closed. Added
+  `OpenPakController::JoinFriendSession(u64 pid)`
+  (`src/citron/legacy_controller.h`/`.cpp`): looks the friend up in the
+  already-cached `Common::OpenPakFriends::Get()`, and if their status is
+  `PresenceOnlinePlay` with a non-empty `app_field`, hands that `app_field`
+  straight to `Common::OpenPakFriends::SetPendingInvitations()` — the
+  exact same local queue `IApplicationFunctions::
+  TryPopFromFriendInvitationStorageChannel` (built earlier this session,
+  see the Phase 6 section above/below) already reads from. No network
+  round trip needed at join time (the presence feed already has the data
+  locally); no `SendFriendInvitation` call needed either, so the whole
+  broken-applet struct problem is sidestepped completely rather than
+  worked around. Wired to a new "Join Game" entry in the friends list's
+  right-click menu (`OpenPakAccountDialog::ShowFriendsContextMenu`,
+  `src/citron/legacy_account_dialog.cpp`), shown only when
+  `OpenPakFriendItem::PresenceRole == 2` (in-game). Compiles clean
+  (`ninja citron`), not yet live-tested end to end.
+
+**Not yet verified live:** whether Outbound's own boot/resume code
+actually calls `TryPopFromFriendInvitationStorageChannel` and does
+something useful with whatever bytes are sitting in it (auto-join), since
+the only previous exercise of that function was via the still-broken
+native applet path, which never got far enough to prove real consumption.
+If Outbound doesn't poll this channel on its own, the fallback is
+resuming/launching Outbound *after* using "Join Game" (matching how a real
+console handles an accepted invitation: HOS launches or foregrounds the
+title and the title itself checks the channel on its own next check,
+typically at boot or from its own multiplayer menu). Next concrete step:
+two-instance live test — host on one profile, `Common::OpenPakFriends`
+should show the host's presence as in-game with a populated `app_field` on
+the other profile once both are signed in to the same (currently local
+test) earlier server, right-click → "Join Game", then start/resume
+Outbound on the joining profile and watch for either an automatic session
+join or citron's own log line for
+`TryPopFromFriendInvitationStorageChannel` firing with real `app_param`
+bytes (confirms Outbound is at least reading the channel, even if the
+join itself needs more work after that).
+
+**Housekeeping still pending, not done:** both citron profiles
+(`~/.config/citron` and `~/.citron-second/config/citron`) are still
+pointed at the local dev earlier server (`OPENPAK_API=http://
+127.0.0.1:8099`) with test-account tokens, not the real production
+account — `openpak_account.txt.real-backup` copies exist for both and
+must be restored (and `OPENPAK_API` unset) once this feature is done
+being tested locally, so the user doesn't lose access to their real
+account. The `openpak-account` (`invitations.go`/`main.go`) and
+`earlier-citron` client-side changes from this session (friend.cpp,
+application_functions.cpp, legacy_friends.h/.cpp, legacy_controller.h/
+.cpp, legacy_api.h/.cpp) are still uncommitted in their respective repos.
+
+### 2026-08-30 follow-up: Join Game tested live -- a self-inflicted regression, a UI feedback bug, and a real new find (hosting alone self-terminates after ~160s)
+
+Restarting both citron profiles to pick up the "Join Game" build broke
+Photon connectivity entirely, unrelated to the friends feature: this
+project's Photon-to-self-hosted-server redirect
+(`GetPhotonRedirectIp`/`OPENPAK_PHOTON_IP` in `sfdnsres.cpp`) is gated by
+an env var only, independent of the persisted `enable_legacy` setting,
+by design (same reasoning as the debug-proxy env var right above it in the
+file) -- but that means it doesn't survive a relaunch unless the launch
+command sets it every time. Forgot to on the first restart: Outbound
+correctly resolved `ns.photonengine.io` to the *real* Photon Cloud
+(`216.120.180.19`), which then rejected our fake test-account token
+("Nintendo validation failed", `op230`). Fixed by always launching both
+profiles with both `OPENPAK_API=http://127.0.0.1:8099` and
+`OPENPAK_PHOTON_IP=127.0.0.1` set. Worth remembering for any future
+restart during local testing.
+
+**"Join Game did nothing":** real bug, not a no-op -- `JoinFriendSession`'s
+only feedback was `StatusChanged`, wired to a cloud-save-tab label (wrong
+page) and the main window's status bar (not visibly reachable while the
+friends dialog sits on top of it). Fixed: `JoinFriendSession` now returns
+a `QString` result directly, and `ShowFriendsContextMenu`
+(`legacy_account_dialog.cpp`) shows it in a `QMessageBox` right where the
+click happened. Compiles clean.
+
+**Confirmed live, a real and useful new fact:** Outbound's own code polls
+`TryPopFromFriendInvitationStorageChannel` continuously and rapidly while
+sitting on the hosting screen -- 12,830 calls logged over ~347s (~37/s),
+always "no invitation waiting" in this test (no real delivery landed on
+the host side during the window observed). This answers one of the open
+questions from the presence-based-join plan above: yes, Outbound does
+poll this channel on its own, no boot-time-only restriction confirmed so
+far.
+
+**New, separate, real finding: hosting alone self-terminates after
+~160 seconds**, reported by the user as "it times out." Traced through
+`~/.local/share/citron/log/citron_log.txt`: at t=160.531s, `Frontend
+<Warning> ForceStop: Force stopping EmuThread` fires, immediately preceded
+by `Service.AM SetTerminateResult: (STUBBED) called, result=0x1a80a
+(2010-0212)` -- i.e. **Outbound's own code calls `SetTerminateResult` then
+exits the process itself**; the "Userspace PANIC!"/backtrace lines
+immediately after are `ForceStop` forcibly suspending the thread mid-exit
+(all frames unresolved, "Initialization-time crash detected at offset 0"),
+not a real crash -- ordering makes this a consequence of the intentional
+exit, not its cause. So this is not a Photon disconnect, not a citron
+crash, and not caused by the new invitation-poll code (confirmed above:
+it never delivered anything on the host side during this run). Outbound
+itself is deciding, after some internal wait/retry budget, that hosting
+has failed and quitting with a specific non-zero result code
+(`2010-0212` -- module 10, description 212; not yet looked up against a
+Nintendo error-module reference).
+
+Immediately before the self-exit, the log shows an unusually tight
+`bsd.cpp Poll` spin (thousands of calls in the last ~5 seconds, ~1.5ms
+apart, not a normal per-frame cadence) -- looks like Outbound was
+synchronously waiting on a specific expected response right before giving
+up. Leading hypothesis, not yet confirmed: our self-hosted
+`earlier-photon` server may be missing some periodic operation real
+Photon Cloud provides while a room sits open with no second player (a
+lobby/room-list refresh, a heartbeat-style ack, or similar), and Outbound
+has a real internal timeout for that which real hardware would also hit
+eventually -- needs a look at `earlier-photon`'s `MasterServerHandler`/
+`GameServerHandler` for what it does *not* respond to during idle solo
+hosting, cross-referenced against a Photon protocol reference for what a
+real region master server sends periodically. Not yet investigated
+further this session; next concrete step if picked back up.
+
+**Practical implication for testing in the meantime:** get the joiner
+into position and use Join Game within Outbound's own ~2-3 minute hosting
+window, not after -- this appears to be a real, possibly hardware-
+accurate constraint of Outbound's own hosting logic, not just a local-test
+artifact.
+
+### 2026-08-30 follow-up 2: "not joinable" explained, Photon server had no persistent logs, a self-inflicted server outage, and the second-host "freeze" isolated to the client
+
+**"That friend isn't in a joinable game right now":** correct output, not a
+bug. Queried the account server directly (`GET /api/friends` as the
+joiner): the host's presence really does have `status=2` but
+`app_field=""`. Root cause: `IFriendService::UpdateUserPresence` (10610) --
+the only code path that ever sets a non-empty `app_field` -- **is never
+called by Outbound**, confirmed by grepping two full log captures spanning
+an entire hosting session (crash-run and a clean run) for
+`UpdateUserPresence`/`DeclareOpenOnlinePlaySession`/
+`DeclareCloseOnlinePlaySession`: zero hits in either. The `status=2` friends
+see instead comes from a **frontend heuristic**
+(`Common::OpenPakFriends::SetLocalStatus(PresenceOnlinePlay)`,
+`main.cpp:4506`, inside `OnStartGame`) that marks *any* running game as
+"in-game," unconditionally, regardless of whether it's actually hosting or
+even online-capable. **This means the presence-based join plan's core
+assumption doesn't hold for Outbound**: unlike ARMS/Splatoon 2 (which do
+populate `app_field` via `UpdateUserPresence`, hence `FixupInGameFlag`/
+`IsArmsSessionActive` existing at all), Outbound apparently never
+publishes its session info through the standard friend-presence API. The
+`JoinFriendSession`/"Join Game" code added this session is correct and
+will work the moment `app_field` is non-empty for real -- but nothing
+currently makes that true for Outbound. Not yet confirmed whether Outbound
+conveys session-join info some other way entirely (worth checking whether
+it calls `UpdateUserPresence` at some *other* point not yet observed, e.g.
+only right as a second player is about to be invited, or whether it
+relies solely on the native invite applet's own separate channel).
+
+**Self-inflicted Photon server outage while chasing this:** restarting
+`earlier-photon`'s `BlackIce.Server.Host` to finally capture its trace
+output to a file (previously going to an unread anonymous pipe -- opaque
+this entire project) failed with ".NET 8.0 required, only 9.0.19 found":
+the system's net8.0 shared runtime is gone (likely removed by a routine
+system update since the server was first started, hours earlier in this
+session). Fixed with `DOTNET_ROLL_FORWARD=Major`, restored alongside the
+four `BLACKICE_Server__*` env vars the original launch used
+(`NameServerAlt=27000`, `MasterServerAlt=27001`, `GameServerAlt=27002`,
+`Listener__DeadTimeoutSeconds=600`) -- all six UDP ports (5055/5056/5058
++ the three Alt ports) confirmed listening again. The server was fully
+down for about a minute during this, which is what produced the "1001"
+error the user saw -- unrelated to any of the actual OpenPak/Outbound
+investigation. **Worth remembering: any future `dotnet run` for this
+server needs `DOTNET_ROLL_FORWARD=Major` now**, and ideally the trace log
+path (now captured, previously never was) should get written to
+permanently rather than only for ad-hoc sessions.
+
+**With the server's own trace log finally readable, two real findings
+about the "hosting times out" behavior:**
+
+1. The server side is completely clean during a solo-hosting session that
+   later self-terminates: `OpAuthenticate` on all three servers succeeds,
+   `EnterRoom "PMPQYE" actor=1 occupants=[1]` succeeds, Fusion's own
+   handshake (event 100) and steady small event-101 heartbeats flow
+   continuously with zero warnings/errors/drops for the entire session.
+   Whatever makes Outbound decide to call `SetTerminateResult(0x1a80a,
+   2010-0212)` and exit is **not a reaction to any missing or malformed
+   server response** -- it's an application-level decision Outbound makes
+   on its own. Duration to that decision varies a lot between runs (16s,
+   ~146s, ~160s in three different observations), which doesn't fit a
+   fixed wall-clock timeout -- possibly retry-count-based against
+   something with variable latency, or gated on a condition unrelated to
+   elapsed time (the empty-`app_field`/no-`knownPlayers` finding above is
+   one live theory: the room's own `GameProperties` include
+   `"knownPlayers"=""`, and Outbound's own naming suggests it may be
+   checking that against actual invited players before deciding hosting
+   is "real"). Not yet confirmed either way -- next step if resumed.
+
+2. **The reported "click host again, it freezes" is a distinct, real bug,
+   and it's entirely client-side**: the server's trace log shows exactly
+   **one** `OpAuthenticate`/`EnterRoom` cycle total across the whole
+   session -- the second hosting attempt never sent a single packet to
+   the Photon nameserver. citron's own log confirms a second `BootGame`
+   for Outbound started immediately after the first session's
+   `ForceStop`/`OnEmulationStopped` (same citron process, not a
+   relaunch), and that second run sat for ~95 seconds doing something
+   that never touched the network before *also* hitting
+   `SetTerminateResult(0x1a80a, 2010-0212)`/`ForceStop`. Since this is the
+   same long-running citron process across both attempts, the leading
+   theory is **stale global state left over from the first session's
+   abrupt guest-side `ExitProcess`** not being cleaned up before the
+   second boot -- a held lock/handle/service state that stalls Outbound's
+   own startup sequence before it ever gets far enough to open a Photon
+   connection. Candidates to check first if resumed: whatever HOS
+   service/handle Outbound touches earliest in its boot sequence (savedata
+   mount, account service, or friend service state), not the new
+   invitation-queue code added this session (that queue was empty/idle on
+   the host in both runs, per the `TryPopFromFriendInvitationStorageChannel`
+   log counts, so it's an unlikely culprit). Confirming exactly where the
+   second run stalls would need a live backtrace/breakpoint during the
+   ~95s window, not just log grepping -- not yet attempted.
+
+### 2026-08-30 follow-up 3: correction — repeated launches do reach Photon; the fourth run was manually force-stopped
+
+Re-reading the complete Citron log disproved the stale-global-state conclusion
+at the end of the previous follow-up. The same long-running Citron process
+booted Outbound four times. The first three launches all resolved
+`ns.photonengine.io` and reached the local Photon server successfully; their
+first Photon DNS requests were at emulator times `86.108`, `200.796`, and
+`348.325` seconds. Relative to each `BootGame: Booting game` line, those were
+about 43, 53, and 105 seconds into the guest run. Thus the second and third
+launches were slow, but neither was stuck before networking.
+
+The fourth launch (`BootGame` at `486.341`) has no Photon DNS request before
+`ForceStop` at `654.316`, but unlike the preceding three shutdowns it has no
+`SetTerminateResult(0x1a80a)` line at all. It was externally force-stopped and
+cannot support the claim that Outbound self-terminated or that stale Citron
+state prevented Photon startup. Also, in the preceding three runs the logged
+ordering is `ForceStop` first and `SetTerminateResult` roughly 17–18 ms later,
+not the reverse. The termination-result call may be part of teardown racing
+with the frontend stop, so it is not evidence by itself that Outbound initiated
+the shutdown. Treat the earlier "hosting self-terminates" and "second-host
+freeze is entirely client-side" conclusions as unconfirmed until reproduced
+with explicit notes distinguishing user-initiated Stop from an unsolicited
+exit.
+
+The real remaining blocker is still join discovery: Outbound does not call
+`IFriendService::UpdateUserPresence`, so its host room/session ID never reaches
+the earlier server's friend `app_field`. The next implementation should establish an
+explicit room-registration path (most naturally from `earlier-photon`, which
+sees both the authenticated user and created room name) to the account/presence
+service, rather than attempting more Citron restart-state debugging.
+
+### 2026-08-30 follow-up 4: Outbound's real invitation application parameter captured
+
+The native MyPage applet's "Invitation sent" UI does not call Citron's
+`IFriendService::SendFriendInvitation` implementation. Outbound instead passes
+the application parameter into MyPage as part of the applet's input storage.
+A temporary diagnostic on `ILibraryAppletAccessor::PushInData`, gated to
+MyPage, captured that input during a real hosted room. The raw diagnostic was
+removed immediately after analysis because the surrounding 4,264-byte applet
+input also contains unrelated identifiers.
+
+For room `CNRXJE`, Outbound's complete game-defined application parameter is
+exactly 11 bytes:
+
+```
+01 00 00 00 06 43 4e 52 58 4a 45
+```
+
+This is a little-endian `u32` value/version `1`, a one-byte string length `6`,
+then the six ASCII room-code bytes. In compact form:
+
+```
+u32_le(1) || u8(6) || ascii(room_code)
+```
+
+The applet input stores those 11 bytes contiguously and immediately follows
+them with an integer value `11`, independently confirming the parameter's
+length. This removes the last format uncertainty from the explicit
+room-registration path: `earlier-photon` can construct the exact payload from
+the room name without guessing or copying a larger Nintendo applet struct.
+
+### 2026-08-30 follow-up 5: stable hosting and the native-invite completion gap
+
+The shared room-registration path is now implemented across Photon and the
+account service. Emulator BAAS tokens carry a signed `openpak` account credential;
+Photon prefers that over emulator-generated `bs:did` values, while retaining
+`bs:did` resolution for a real Switch. When the first actor enters an Outbound
+room, Photon resolves the account and asks `openpak-account` to publish the
+11-byte application parameter above as the host's presence `app_field`.
+
+Two independent Photon compatibility issues were found and fixed live:
+
+- Outbound hosts with `JoinGame` plus create-if-missing, not `CreateGame`.
+  It also repeats the same game-server join before consuming the first reply;
+  the retry must return the same actor and room properties idempotently.
+- After Fusion's code-101 `Connect`/`Accepted` exchange, a solo Shared-mode
+  host sends 14-byte relay data packets (`PacketType=4`). The accepted local
+  and remote IDs form a self-loop, so those packets must be delivered back to
+  the sole actor. Without that loopback, Host Game expired after about 16
+  seconds. With it, hosting remained stable past the former timeout.
+
+Room publication was confirmed live for the linked host account, without
+showing the room code in the Switch-facing UI. This is publication only; it
+does not itself send an invitation. The intended user flow remains:
+`Host Game -> room created -> Invite Friends -> recipient joins`.
+
+The remaining native-invite gap was isolated separately. Firmware MyPage shows
+"Invitation sent" and returns a four-byte success result `00 00 00 00`, but in
+Citron it makes no `SendFriendInvitation` IPC call and therefore causes no
+Reference mailbox request. Outbound then opens MyPage again; canceling that loop
+eventually produces its Timeout message. Citron now caches the validated
+11-byte Outbound parameter supplied to MyPage and, for the unambiguous
+single-eligible-friend case used by this end-to-end test, reproduces MyPage's
+missing network side effect after its success result. Multi-friend selection
+still requires recovering the selected PID list rather than broadcasting to
+every friend.
+
+### 2026-08-30 evening: invitation delivery fully solved, MyPage's real repeat-open bug pinned down, external confirmation Outbound has no friend-browse UI
+
+The machine hosting this whole stack rebooted, killing `openpak-account`,
+`earlier-photon`, and both citron instances. Bringing everything back up
+surfaced two housekeeping facts worth keeping for the next restart:
+`openpak-account` listens on `:8080` by default, not `:8099` — it needs
+`PORT=8099` set explicitly to match what citron's `OPENPAK_API` expects.
+`earlier-photon` needs `DOTNET_ROLL_FORWARD=Major` (still only .NET 9 is
+installed) plus the same four `BLACKICE_Server__Ports__{NameServerAlt,
+MasterServerAlt,GameServerAlt}`/`Listener__DeadTimeoutSeconds` env vars as
+before. Both citron profiles need `OPENPAK_API=http://127.0.0.1:8099` and
+`OPENPAK_PHOTON_IP=127.0.0.1` set on every single launch — neither
+survives a restart.
+
+**A real account mismatch explained an earlier session's "nothing arrives"
+symptom.** The second citron profile (`~/.citron-second`) was signed in as
+`testjoin` (pid `1800000002`), which is mutual friends with `testhost`
+(`1800000001`) — but the actual host profile (`~/.config/citron`) is signed
+in as `OutboundHost` (`1800000003`), whose real friend is `OutboundJoiner`
+(`1800000004`). Two disjoint friend pairs, not one — the invitation was
+correctly rejected/never queued for an account that was never the friend
+being invited. Fixed by logging the second profile into `OutboundJoiner`
+via `POST /api/login` and overwriting its `openpak_account.txt`. Worth
+double-checking which accounts are actually signed in (not just which
+*profile directories* are running) before concluding delivery is broken.
+
+**Root cause of "invitation sent but nothing received" found and fixed:
+`TryPopFromFriendInvitationStorageChannel`'s real semantics are event-driven,
+not polled, and nothing was ever signaling the event.** Real hardware has
+the guest call `GetFriendInvitationStorageChannelEvent` once and then wait
+on it; our implementation had the event object but nothing ever called
+`.Signal()` on it, so a guest genuinely blocked waiting for a new invitation
+would never wake up — it would only ever see one if it happened to poll
+again on its own unrelated schedule. Fixed in `earlier-citron`:
+`Common::OpenPakFriends::SetInvitationSignalCallback(std::function<void()>)`
+lets `IApplicationFunctions`'s constructor register a weak-`shared_ptr`-bound
+callback (per running application, harmless no-op if the application has
+since torn down) that signals `friend_invitation_storage_channel_event`;
+`SetPendingInvitations` invokes it (outside its own lock, since signaling a
+kernel event must never happen while holding a Common-layer mutex a kernel
+callback could re-enter through) whenever new invitations are queued.
+
+**Confirmed live, three separate real invitations, all successful:** host
+sends via MyPage → `openpak-account` queues it (real mutual-friends check
+passes) → joiner's 5-second poll timer (`OpenPakController::PollInvitations`)
+finds it → the new signal wakes Outbound's own waiting thread → its own
+`TryPopFromFriendInvitationStorageChannel` call returns the real 11-byte
+room-code parameter (`u32_le(1) || u8(6) || ascii(room_code)`, format
+confirmed the session before). Every one of the three landed within
+single-digit milliseconds of the account-server poll finding it — this is
+no longer a "maybe it'll show up eventually" mechanism, it's a real,
+reliable, event-driven delivery path.
+
+**A second real bug found in the same diagnostic pass:** a diagnostic left
+mid-session in `friend.cpp`'s `GetFriendDetailedInfoV3` (writing synthetic
+`"FRONT-TEST"`/`"TAIL-TEST"` placeholder names into the friend-picker buffer
+to determine which offset the picker tile reads from) had already answered
+its own question — neither offset renders the tile's name/status, that
+still needs real decompiler-grade RE — but was left live, which is why a
+friend appeared with no name/picture/status. Reverted to writing real
+friend entries at both offsets (the combination that previously got a tile
+selectable through to a completed send), not placeholder text.
+
+**A real, separate citron applet bug found and fixed: `ControllerAppletVersion`
+only went up to `Version8` (11.0.0+), but Outbound on firmware 20.0.0 sends
+version `9`.** This hit `UNIMPLEMENTED_MSG` and asserted, which — confirmed
+live via `gdb -p <pid> --batch -ex "thread apply all bt"` on a genuinely
+stuck joiner process — leaves all four guest CPU cores idle
+(`Core::CpuManager::MultiCoreRunIdleThread`, the same "nothing runnable"
+signature as the original documented freeze bug earlier in this project)
+because the guest thread that opened the Controller Support prompt never
+gets a response. The fix was simple once found: version `9`'s `arg_size`
+(1072 bytes) is *exactly* `sizeof(ControllerSupportArgNew)`, the same struct
+`Version7`/`Version8` already use — just a missing version number, not an
+unknown struct. Added `Version9` to both switches in
+`src/core/hle/service/am/frontend/applet_controller.{h,cpp}`. Confirmed live
+this stopped the assert. **Caveat:** a similar-looking stall (same idle-core
+signature, Qt main thread sitting in the plain `QCoreApplication::exec()`
+loop with no nested modal dialog on top, meaning `QtControllerSelector`'s
+dialog never actually got shown) was observed once *after* this fix was
+already in place, immediately after opening Outbound's multiplayer menu —
+but did not reproduce on a later, identical-looking attempt (that time 2 of
+4 cores were genuinely busy running real guest JIT code, no stall, no
+dialog needed at all). Not conclusively tied to anything; flag as an
+intermittent, not-reliably-reproducible citron UI bug if it comes up again,
+worth another live `gdb` backtrace if/when it does.
+
+**A real, separate toast-visibility bug found and fixed:** `OpenPakToast::Show`
+unconditionally returned early unless `qApp->activeWindow()` was the
+window calling it — meaning an invite toast could only ever appear on
+whichever citron *process's* window currently had OS focus. Since host and
+joiner are two separate citron processes/windows, and the natural thing to
+do while testing is watch the host, the joiner's own invite toast was
+silently getting dropped every time. Added a new `OpenPakToast::Kind::
+GameInvite`, wired end-to-end: `OpenPakController::PollInvitations` now
+also emits `FriendInvitationReceived(pid, name)` alongside its existing
+silent `Common::OpenPakFriends::SetPendingInvitations` queuing (still
+guest-consumable regardless of the toast), shown via the shared toast
+widget with a new purple "GAME INVITE" category. `GameInvite` toasts bypass
+the OS-focus check (still respect minimized) since — like a real console's
+HOME-menu-level invite notification — this is meant to interrupt regardless
+of what currently has focus; other toast kinds keep the original
+focus-gated behavior. Confirmed live across all three invitations.
+
+**A third real bug found live, from clicking that new toast:** the click
+handler unconditionally called `BootGameFromList`, which force-stops
+whatever's currently running before booting — clicking the toast while
+Outbound was already running (a live Photon session, mid-connection) force-
+killed it, and rebooting into that torn-down state corrupted guest memory
+(`Unmapped Write64` errors). Fixed: the handler now checks `emulation_
+running && system->IsPoweredOn() && play_time_manager->GetProgramId() ==
+OutboundTitleId` first and no-ops if Outbound is already the active title
+— the invitation data was already delivered straight into its own local
+channel regardless of the click, so there's nothing useful left for a
+reboot to do in that case anyway. Only boots fresh if Outbound wasn't
+already running.
+
+**MyPage's real, repeatable bug, confirmed symmetric (host→joiner and
+joiner→host both hit it identically):** the *first* "Invite Friends"
+attempt in a session always succeeds cleanly (`size=4 value=00000000` →
+our reproduced delivery → `-> ok`). MyPage then silently reopens itself
+into the same "select friends to invite" picker, with no user action.
+This *second*, automatic attempt always fails with a different result code
+(`size=4 value=793C0000`, decoding as Nintendo error module `Friends`
+(121)) — the game's own on-screen error dialog. Roughly 100–110 seconds
+after that failure, Outbound sends an explicit Photon ENet `Disconnect`
+command itself (confirmed client-initiated via packet trace, not a server
+drop) and tears down the whole hosted session — matches the
+already-documented "Outbound tears down the session on any Invite-Friends
+irregularity" behavior from earlier sessions. **Leading theory, not yet
+confirmed:** MyPage may be expecting some delivery-*acknowledgement* signal
+back — real hardware's `SendFriendInvitation`/mailbox round trip likely has
+some confirmation step we're not replicating, so from MyPage's perspective
+the first send looks unacknowledged/failed even though our own reproduction
+of its side effect (calling `WebService::OpenPakApi::SendInvitation`)
+succeeded — and it retries. Worth checking real `IFriendService` command
+signatures (around cmd 30900/30901) for any confirmation/ack parameter we
+aren't currently sending back through `PushOutData`/`PushInData`.
+
+**Confirmed empirically, live, that Outbound's own multiplayer menu has no
+"browse friends' joinable games" UI at all** — not just from static IL2Cpp
+RE as before. Opening the joiner's multiplayer menu from a cold state goes
+straight to a "start a hosting session" prompt, with zero `IFriendService`/
+session-related IPC calls firing just from opening it. Three invitations
+already delivered via the storage-channel mailbox (consumed by some
+background thread well before the menu was ever opened) did not visibly
+change this landing screen. **External research confirms this independently:**
+per Outbound's official Steam/Nintendo eShop listings and multiple
+third-party player guides (treat procedural details as plausible, not
+primary-source-verified — several guide sites use near-identical phrasing
+suggesting a shared/derived source rather than independent hands-on
+reporting), the real console flow is **"Host Session" → "Invite" → pick a
+friend from the platform's own native friends list** — there is no in-game
+session browser on any platform, PC included (PC instead uses a manually-
+typed join code). This matches what this project has built: presence/
+invite delivery is meant to be handled by the platform layer (Nintendo's
+real Friends system, or this project's own citron-side toast/mailbox), not
+by anything inside Outbound's own multiplayer menu. The guides could not
+confirm whether real hardware's "Invite" hands off to the actual system
+Friends applet/overlay or an in-game list merely reading the console's
+friend data — still an open question, but the "no browse, invite-only"
+shape is now corroborated from an independent source, not just this
+project's own RE. One incidental finding from the same research, unrelated
+to tonight's blocker but worth remembering if a live host/join test seems
+to silently fail before either side can even try: co-op is reportedly
+gated behind an early-game tutorial step (repairing a road barrier) that
+must be completed before hosting is available at all.
+
+**Not yet tested:** delivering a fresh invitation while the joiner is
+already sitting on the "start hosting" landing screen (attempted once, but
+the joiner ended up hosting its own separate session instead of receiving/
+joining — the specific "does a live delivery change what's already on
+screen" test is still open). Also not yet found: a manual "Join"/"Enter
+Code" option anywhere in Outbound's own Switch UI, if one exists at all
+(the external research above didn't rule it out, just didn't confirm it
+either).
+
+### 2026-08-30 late evening: a real format bug found in the storage-channel payload — likely why nothing visible happens after a successful pop
+
+Dispatched two research agents to check this project's own findings against
+real Nintendo documentation and Outbound's real player-facing multiplayer
+UX. The second agent's finding is directly actionable: switchbrew documents
+`TryPopFromFriendInvitationStorageChannel`'s popped `IStorage` as **not** a
+bare byte blob — the first `0x10` (16) bytes are the sender's account
+`Uid`, and the actual application-defined payload only starts at offset
+`0x10`. `IApplicationFunctions::TryPopFromFriendInvitationStorageChannel`
+(`src/core/hle/service/am/service/application_functions.cpp`) was pushing
+`app_param` verbatim at offset 0, with no `Uid` header at all — a real,
+concrete format mismatch, and a strong candidate explanation for tonight's
+whole "the pop succeeds, real bytes arrive, and then visibly nothing
+happens" mystery: if Outbound's own code reads/validates a leading `Uid`
+before trusting what follows, a missing header would make it silently
+discard or misinterpret the real room-code bytes right after a clean pop.
+
+**Fixed:** `TryPopFromFriendInvitationStorageChannel` now prepends a
+16-byte `Uid` (the sender's Reference pid run through the same deterministic
+pid→`Uid` derivation `friend.cpp`'s `UidForPid` already uses elsewhere in
+this codebase, kept as a small local copy rather than shared across a
+header) before the real `app_param` bytes, matching real hardware's
+documented layout. Compiles clean. **Not yet live-tested** — the next
+invite send/receive round trip should be watched closely for any change in
+what happens after the pop (an in-game reaction finally appearing would
+confirm this was the real blocker; no change would mean the `Uid` header
+wasn't actually what Outbound's own parser needed, and the real blocker is
+still open).
+
+The same research pass also surfaced, from switchbrew, that the *real*
+system-side call that fills this channel is `IApplicationAccessor::
+PushToFriendInvitationStorageChannel` (cmd 180) — invoked by system
+software (am sysmodule / friend service, likely triggered by the MyPage
+applet or NPNS), never by the game itself. citron's own `cmd 180` is still
+an unimplemented stub (`nullptr`); this project's mailbox entirely bypasses
+it by injecting directly into `Common::OpenPakFriends`'s pending-invitation
+queue, which is a legitimate and much simpler implementation choice (same
+end effect for the receiving game) rather than a gap that needs closing.
+
+Also confirmed from the first research agent, independent of the second:
+real hardware's native MyPage applet does **not** call `SendFriendInvitation`
+/`SendFriendInvitationV2` (cmd 30900/30901) at all for actual delivery —
+this matches what this project already found live weeks ago (MyPage relays
+the game's own application-parameter bytes through its own input storage
+and performs Nintendo's real network send internally, invisible to the
+game's own `IFriendService` session). `SendFriendInvitation`'s real
+signature, per an earlier Ryujinx fork's own independent RE, is `(Uid userId,
+NetworkServiceAccountId[] friendIds, in FriendInvitationGameModeDescription
+description, ApplicationInfo applicationInfo, byte[] appParameter, bool)` —
+already the same signature this project's own `friend.cpp` comment cites,
+now cross-confirmed from a second independent source.
+
+**Still genuinely unconfirmed, flagged explicitly by the research rather
+than guessed at:** what a real `Friends` (module 121) error description
+code actually means beyond the bare `2000+module`/`description` format —
+switchbrew does not enumerate individual Friends description strings, so
+the `2121-0001` this project's own stub produces, and whatever description
+number a real `793C0000`-style MyPage failure decodes to, both remain
+unverified against any real reference.
+
+### 2026-08-30 late evening, continued: root cause of "nothing happens after a successful pop" — CONFIRMED, both statically and live
+
+Pushed the same IL2Cpp RE further per explicit instruction to investigate
+fully rather than stop at "needs better tooling." Extracted Outbound's real
+decrypted `main` NSO (already sitting at `~/main` from earlier project
+work) through `Il2CppDumper` again — this time kept the output
+persistently at `~/outbound-re/` (outside any repo, never
+committed, copyrighted game material) instead of discarding it, per
+explicit request to keep material for future reference "until we get 100%
+of it working." Full reproduction steps, every RVA, and all disassembly
+excerpts are in `~/outbound-re/NOTES.md` — this section is the
+summary.
+
+**Traced the real consumption chain in Outbound's own compiled code, not
+guessed at:**
+
+1. `Huey.Core.Runtime.Systems.Network.NetworkSystemSwitch.CheckForInvite()`
+   runs every frame (sits beside `Update()` in the same class). Calls the
+   real SDK binding `Friends.TryPopFriendInvitationNotificationInfo`
+   (confirmed — this is the managed wrapper around the raw `TryPopFrom
+   FriendInvitationStorageChannel` HIPC response, unpacking the single
+   `IStorage` into separate `Uid`/size/buffer values) with a `byte[1024]`
+   buffer (`0x400` = `FriendInvitationApplicationParameterSizeMax`,
+   confirmed matching Outbound's own compiled constant).
+2. On success, two guard checks run before anything is cached — one calls
+   a generic `Dictionary`-style lookup keyed on the **literal constant
+   `2`** (not the sender's identity — corrects an earlier, wrong read of
+   this as a friends-list cross-reference), the other a collection-
+   membership check whose target collection isn't identified. Either can
+   silently discard the invitation.
+3. If both pass: constructs a real `InviteData` (confirmed ctor at the
+   right RVA) — **`PlatformSessionID` and `PlatformSessionName` are both
+   set from an unrelated internal lookup chain, NOT parsed from the popped
+   payload; only the third constructor argument, `CustomData`, is our real
+   delivered bytes.** Caches it via `set_CachedInvite`.
+4. `NetworkSystemSwitch.OnGameReadyForSessionEvents()` checks `_cachedInvite
+   != null`, then looks up a delegate/event object and — only if something
+   actually subscribed — invokes it with the cached invite. A third
+   independent way this can silently no-op.
+5. The real subscriber is `NetworkManager` (Huey's top-level singleton,
+   genuinely implements Photon Fusion's `INetworkRunnerCallbacks`):
+   `StartJoin(InviteData)` starts a `JoinPlatformSession(InviteData)`
+   coroutine, whose compiled state machine has a `JoinSessionRequest`
+   field. Disassembled the exact request-construction point:
+
+   ```
+   ldr x20, [inviteData, #0x10]     ; reads PlatformSessionID (offset 0x10)
+   ... allocate JoinSessionRequest ...
+   mov x1, x20                       ; SessionID = PlatformSessionID
+   bl  JoinSessionRequest..ctor
+   ```
+
+   **`CustomData` (offset `0x20`, our real room-code bytes) is never read
+   again after being cached. The actual join request is built from
+   `PlatformSessionID` — the field populated from something unrelated to
+   our delivery, not our payload.** This holds regardless of whether the
+   two guard checks in step 2 pass or fail: even in the best case, the
+   join uses the wrong session identifier.
+
+**Live-confirmed via a real attached debugger, not just static reading.**
+earlier-citron has a working guest-level GDB stub (`use_gdbstub`/
+`gdbstub_port` settings, default port `6543`) — genuine remote ARM64
+debugging of the actual running Outbound process, using the system's own
+`gdb` (no special cross toolchain needed; Fedora's stock `gdb` already
+supports `set architecture aarch64`). Module base address confirmed live
+from citron's own log line (`loaded module main @ 0X80006000`); add any
+`dump.cs` RVA to that base for a real breakpoint address. One real gotcha
+worth remembering: **citron's gdbstub has no clean detach — any client
+disconnect, deliberate or not, immediately kills emulation
+(`Shutting down emulation` in the log)**, so a debugging session has to do
+everything it needs in one script from attach to final inspection.
+
+Set a conditional breakpoint (`break ... if $x0 != 0`) right after the
+`TryPop` call inside `CheckForInvite`, which normally hits dozens of
+times/sec with "nothing queued" and only genuinely stops for a real pop.
+POSTed a distinctive test invitation directly to `openpak-account` via
+`curl` (reusing the host's saved token — a reliable way to trigger this on
+demand without needing the host's live GUI/MyPage flow). The moment the
+breakpoint fired for real, read the live popped buffer directly out of
+guest memory: **`01 00 00 00 06 51 51 51 51 51 51`** — `u32_le(1)`,
+`u8(6)`, ASCII `"QQQQQQ"` — byte-for-byte identical to what was sent.
+**This confirms the entire delivery chain (server queue, joiner poll,
+event-driven wakeup, the `Uid`-header wire format from earlier tonight, and
+the C# wrapper's Uid/size/buffer unpacking) is correct, live, not just in
+theory.** The remaining gap is exclusively the `PlatformSessionID`-vs-
+`CustomData` field mismatch found via static analysis — independently
+confirmed to be the real, sufficient explanation for the entire night's
+"nothing visibly happens" mystery, unrelated to payload correctness,
+timing, or which screen the joiner is on.
+
+**What's still open, next steps if resumed** (full detail in
+`~/outbound-re/NOTES.md`):
+
+1. What `PlatformSessionID` actually resolves to live (a 3-hop pointer
+   chain in `CheckForInvite` not yet read at runtime — the multi-stage gdb
+   script that would have captured this got cut short when the session
+   ended). A focused single-breakpoint gdb run at `base+0x3f3acb4` (right
+   after the value loads) reading it as a standard IL2Cpp `System.String`
+   would answer this directly.
+2. Whether that value comes from something citron already controls (in
+   which case the fix is making it carry the real room code at the
+   source, not touching the invitation mailbox at all) or something not
+   yet implemented.
+3. Only once (1)-(2) are answered does a real fix become possible — this
+   project cannot patch Outbound's own compiled code, so the only lever
+   is making whatever populates `PlatformSessionID` end up correct.
+
+### 2026-08-30 late night: `PlatformSessionID` resolved — it's a hardcoded empty string (see follow-up below for what this actually means)
+
+Picked this straight back up per explicit instruction to keep going rather
+than stop at "needs a decompiler." Two real things happened, in order.
+
+**First, found and partially fixed a real citron bug, then found and
+root-caused a second, deeper one underneath it.** earlier-citron's own
+gdbstub has a `step`-after-breakpoint bug: `debugger.cpp`'s
+`DebuggerAction::StepThreadLocked` handler was missing a `ResumeEmulation()`
+call present in its `StepThreadUnlocked` sibling — genuinely fixed and
+rebuilt (`src/core/debugger/debugger.cpp`). That fix alone didn't resolve
+the symptom (`stepi` still never advanced the guest PC), so the
+investigation went one level deeper: **confirmed live, conclusively, that
+even after fully `delete`-ing a hit software breakpoint — verified via
+`x/4xb` that the correct original instruction bytes are genuinely restored
+in guest memory — a subsequent `continue` still immediately re-raises a
+real `SIGTRAP` at the identical PC.** Guest memory is provably correct;
+execution still re-traps regardless. This means dynarmic's own JIT-compiled
+native code block for that address, compiled once while the breakpoint's
+trap instruction was still present, is never recompiled or invalidated to
+reflect the restored bytes — `Core::InvalidateInstructionCacheRange`
+either isn't reaching dynarmic's JIT cache for this path or isn't
+sufficient to force recompilation. **Not fixed** — a real, separate,
+deeper citron bug, worth a standalone report/investigation, out of scope
+for tonight's actual goal. Full diagnostic trail (the exact commands and
+outputs that isolated this) is in `~/outbound-re/NOTES.md`.
+
+**Worked around it instead of fixing it**, since the actual target data is
+static/global, already fully initialized during any normal frame — no
+resume-past-a-breakpoint was needed at all. Broke once at `CheckForInvite`'s
+entry thunk (`base+0x3f3aa90`, base `0x80006000` confirmed stable across
+every relaunch tonight), and from that single, very first hit, read the
+whole `[table+0x668]→[+0x90]→[+0xb8]→deref` pointer chain directly via
+gdb's memory-read commands (`inf.read_memory`), computing each hop's
+address from the previous read's actual value:
+
+```
+x23  = 0x86dae360    (from table_slot 0x86a18668)
+x8_a = 0x114da1d300   (from x23+0x90)
+x8_b = 0x114dfadff0   (from x8_a+0xb8)
+x20  = 0x114dfb0f40   (from x8_b -- this is PlatformSessionID's source)
+```
+
+Read `x20` as a raw IL2Cpp object: `klass_ptr=0x114da1d300` (exactly equal
+to `x8_a` — consistent with `[x23+0x90]` being a cached `typeof(string)`
+class reference), `monitor=0`, **`length=0`**.
+
+**Reproduced identically in two fully independent gdb sessions (separate
+citron relaunches) — byte-for-byte the same chain values both times,
+confirming this is stable, deterministic data, not per-run noise or
+misread garbage.**
+
+**The answer: `PlatformSessionID` is a genuine, valid, empty `System.String`
+(`""`) — not corrupted memory, not null, not garbage.** This is the exact
+value `CheckForInvite` passes as both `platformSessionID` and
+`platformSessionName` into `InviteData`'s constructor (per the earlier
+static disassembly — `mov x1, x20` / `mov x2, x20`, same register), and
+`NetworkManager.JoinPlatformSession` builds `JoinSessionRequest.SessionID`
+directly from `InviteData.PlatformSessionID` — i.e. from this exact empty
+string, confirmed via the earlier independent static-disassembly finding.
+
+**This closes the investigation with a definitive, non-inferred root
+cause:** Outbound's own compiled `CheckForInvite` reads a stable
+"no active session" placeholder for the field it uses as the actual join
+target, regardless of what real room-code data has been correctly
+delivered into `CustomData` right alongside it. This is not a citron or
+Reference delivery defect in any way — every layer this project built
+(server queue, event-driven wakeup, wire format, toast notification) is
+independently confirmed correct and working. The bug is entirely inside
+Outbound's own binary, in a code path that appears to have simply never
+been wired up to actually consume the room code it's handed.
+
+**Practical implication, not itself proven tonight but a strong working
+hypothesis:** since this specific code path is very likely the *only*
+consumer of the friend-invitation mailbox on the Switch build (nothing
+else in `NetworkSystemSwitch`/`NetworkManager` references `CachedInvite`
+per the earlier full disassembly), and since real players' documented
+experience (per this project's earlier external research) shows Switch's
+real invite flow going through the native system Friends applet with no
+in-game "browse/join" UI at all, it's plausible this exact bug exists on
+real hardware too — i.e., the mailbox-driven auto-join path may never have
+actually worked for Outbound on any real console, and the *real*, working
+flow (whatever it is) doesn't go through `CheckForInvite`/`InviteData` at
+all. This remains unconfirmed — would need a real-hardware capture to
+settle definitively — but it reframes the remaining problem: further work
+here is no longer a delivery or format question, it's "does Outbound have
+*any* working join path reachable without real hardware's native Friends
+applet flow" — a much narrower, more honest question than where this
+investigation started.
+
+### 2026-08-30 late-late night: the "empty string" finding confirmed via full static disassembly, not just live memory — and a concrete path forward that doesn't require finishing the native RE
+
+Corrected course after being pushed back on: "multiplayer works on the
+switch" is right, and a shipped, working feature can't rely on code that's
+unconditionally broken on every platform — so if `CheckForInvite`
+really always sends an empty `PlatformSessionID`, real hardware's invite
+flow must not be going through that function at all, and the job is to
+find what it actually does, not to declare Outbound's binary broken and
+walk away.
+
+Three things nailed down for real this session (all in
+`~/outbound-re/NOTES.md` in full, with the disassembly):
+
+1. **Outbound's C# layer has no binding for `PopLaunchParameter`/
+   `UserChannel` at all** (`nn.oe` namespace checked in full — only
+   `HealthWarningForRegionChina`/`Language`/`CrashReport`/`ScreenShot`/
+   `ProgramTotalActiveTime`). citron's real cold-boot launch-parameter
+   mechanism (`applet_manager.cpp:317`,
+   `user_channel_launch_parameter.swap(m_system.GetUserChannel())`) is
+   confirmed real and working, but if real hardware's invite-accept uses
+   it, Outbound's own code can't read it directly — it'd be entirely
+   inside Unity's native (non-IL2Cpp) NX plugin, which this decompile
+   can't see.
+2. **Scanned the entire 84MB decompressed `.text` for every caller of
+   `nn.friends.Friends.TryPopFriendInvitationNotificationInfo`** (the real
+   name for AM command 141, which citron already implements correctly) —
+   exactly one call site in the whole binary, inside `CheckForInvite()`.
+   So our delivery channel is provably the right (and only) one for this
+   code path. Then disassembled all of `CheckForInvite()` start to finish
+   and read, instruction by instruction, what it does with the popped
+   buffer: it copies the real bytes we deliver into a **new byte array
+   used as `InviteData.CustomData`** (confirmed correct — this really does
+   arrive intact), then separately loads a cached empty-string static
+   field and passes *that* as **both** `platformSessionID` and
+   `platformSessionName` into `InviteData`'s constructor. There is no
+   branch anywhere in the function that could make this differ — this is
+   now confirmed by reading the actual construction code, not inferred
+   from a memory snapshot.
+3. **Grepped all of `dump.cs` for every reference to `CustomData`/
+   `CachedInvite`**: `JoinPlatformSession` is the *only* consumer of
+   `CachedInvite` anywhere in Outbound's code, and it only ever reads
+   `.PlatformSessionID` — never `.CustomData`. There's no secondary path
+   waiting to use the data we correctly deliver.
+
+**Bottom line:** this is not a delivery/format bug on our side (proven
+three separate ways now), and the mailbox/`CheckForInvite` path
+genuinely cannot produce a working join on any platform, as shipped. Real
+hardware's actual friend-invite-join mechanism is something else —
+plausibly the native cold-boot launch-parameter path from point 1, which
+we can't finish confirming without reverse-engineering Unity's own native
+Switch plugin (a much bigger, more open-ended undertaking).
+
+**Recommended next step, not yet started:** stop chasing how Outbound
+*normally* learns about an invite, and instead directly drive its own
+real, already-confirmed-correct join entry point. `NetworkManager`
+(`PersistentSingleton<NetworkManager>`, so it has a locatable static
+`Instance`) exposes `IEnumerator Join(string code, bool
+newWaitForRoomToBecomeAvailable = false)` at RVA `0x1BF76C0` — a generic,
+proven join-by-code method, completely independent of the broken
+`InviteData` pipeline (this is almost certainly what a manual code-entry
+UI would call). When a Reference invite is accepted, citron could locate
+the live `NetworkManager.Instance` in guest memory and drive this
+directly — either write the code into `NetworkManager.sessionName`
+(offset `0xB0`) or invoke `Join()` via a manufactured call — bypassing the
+platform-invite layer entirely. This is real, novel engineering (citron
+has no existing facility for injecting a call into a live IL2Cpp/dynarmic
+guest) and hasn't been started.
+
+### 2026-08-31: manufactured guest-call join — the real join trigger, built on the game's own Join + StartCoroutine
+
+Per the previous section's "recommended next step" (drive `NetworkManager.Join`
+directly), but with a critical correction found by actually disassembling `Join`
+(RVA `0x1BF76C0`, capstone, `text.bin`) before building anything:
+
+**`Join` does not start anything.** It only validates nothing, allocates the
+`<Join>d__86` coroutine state machine (`bl 0x5bdde0` = il2cpp object-new with the
+class from metadata slot `[0x6a18000+0xb0]`), sets `<>1__state=0` (+0x10),
+`<>4__this` (+0x20), the bool (+0x28), `code` (+0x30), and RETURNS it. It never
+touches x3 (MethodInfo) and never writes `sessionName` — all of that (code
+validation, ToUpper, `sessionName` = +0xB0, `connectionType=2`,
+`InstantiateRunner`, Fusion `StartGame`) happens later inside `<Join>d__86.MoveNext`
+when Unity's coroutine runner drives it. The previous session's trampoline called
+only `Join` and logged `Join.MoveNext reached` as its success signal — which could
+never have fired even without the crash, because nobody ever started the coroutine.
+Its room-code string was also wrong: it copied the RAW popped bytes (which begin
+with the 5-byte `u32_le(1) || u8(len)` header) as UTF-16 chars, so even a correct
+call would have "joined" garbage. And its NetworkManager.Instance capture checked
+hardcoded VAs (`0x81BF7570`/`0x81BFC760`) that only match one specific ASLR base.
+
+**The two-call recipe, confirmed against the game's own code:**
+`StartJoinOnLoad` (RVA `0x1BF78D0`) ends in a tail call `b 0x4C1A070` with
+x0=this(NetworkManager), x1=IEnumerator, x2=0 — that helper is
+`MonoBehaviour.StartCoroutine`'s managed entry (null-checks both args, loads its
+icall from a metadata slot, calls the engine). So the complete join is exactly:
+
+```
+sm = NetworkManager.Join(code, false)          ; RVA 0x1BF76C0, x0=this x1=code x2=0
+MonoBehaviour.StartCoroutine(this, sm)         ; RVA 0x4C1A070, x0=this x1=sm x2=0
+```
+
+Both calls are non-generic, read no MethodInfo, and were signature-pinned
+(first instruction words `0xa9bc7bfd` / `0xa9bd7bfd`) for runtime verification.
+
+**New facility: `src/core/legacy_guest_call.{h,cpp}`** — no hand-assembled code,
+no mid-function frame assumptions, no hardcoded base:
+
+1. **ARM** — `IApplicationFunctions::TryPopFromFriendStorageChannel` (the invite
+   pop, which runs on the Unity main thread at ~37/s once an invite is queued) now
+   parses the room code out of the delivered app_param (`u32_le(1) || u8(len) ||
+   ascii`, validated) and calls `ArmInviteJoin`. That verifies the game is
+   Outbound, verifies both RVAs' instruction signatures (refuses to inject into a
+   mismatched game version), resolves `System.String`'s Il2CppClass\* via the
+   twice-live-confirmed chain `[base+0x6A12668] → +0x90`, checks
+   `NetworkManager.Instance` is captured, and parks the request.
+2. **FIRE** — `PhysicalCore::RunThread` calls `OnBeforeRun` before resuming any
+   thread; for the armed (Unity main) thread it saves the full guest context,
+   writes a fabricated IL2CPP string (`klass, monitor=0, length, UTF-16`) into a
+   private stack window `[SP-0x2000, SP)` that no live frame or the injected
+   call's own frames can touch, and rewrites the context:
+   `x0=Instance, x1=string, x2=0, fp=0, lr=0 (sentinel), sp=window, pc=Join`.
+3. **CHAIN/RESTORE** — `Join` returns into lr=0 → dynarmic NoExecuteFault →
+   `ExceptionRaised` keeps it quiet (no CRITICAL log/backtrace while a sentinel is
+   pending) and halts with PrefetchAbort; `PhysicalCore::RunThread`'s abort
+   handling calls `OnFault` first: stage Join → reads the returned state machine
+   from x0 and rewrites the context for `StartCoroutine(this, sm)`; stage
+   Coroutine → `SetContext(saved)` and the thread continues exactly where the
+   invitation-poll svc left off, with Unity now driving the real join coroutine
+   (validate → sessionName → connectionType=2 → Fusion connect to our server's
+   room). A real data abort inside the injected call restores the saved context
+   and then deliberately falls into the normal suspend path so the crash is
+   visible, not silently looped.
+
+Supporting pieces:
+
+- **Instance capture, fixed for real** (`ObserveInstanceCapture`, called from the
+  dynarmic `MemoryReadCode` hook): base comes from `process->GetEntryPoint()` at
+  runtime — never hardcoded — and capture points are now joiner-reachable:
+  `NetworkManager.Start` (0x1BF6840) and `OnEnable` (0x1BF6CC0) (PersistentSingleton
+  lifecycle, run on the Unity main thread at scene load), plus the older
+  Host/SendInvitation points. x0 is validated (klass != 0, MonoBehaviour
+  m_CachedPtr at +0x10 != 0) before capture, since MemoryReadCode re-fires after
+  JIT cache flushes with mid-execution register values. If an invite arrives
+  before the instance exists, the code is kept pending and the arm completes at
+  the moment of capture instead of losing the invitation.
+- The old DIAG block's hardcoded-VA capture (guest-side MailboxVA mirror write)
+  was made base-aware; the disabled trampoline itself is untouched and stays off.
+- Env kill switch: `OPENPAK_NO_GUEST_JOIN=1` disables arming entirely.
+- **Scripts** (`scripts/`): `start-services.sh` (openpak-account with PORT=8099,
+  photon with DOTNET_ROLL_FORWARD=Major + the 27000/27001/27002 alt-port env vars,
+  both idempotent), `launch-citron-host.sh` / `launch-citron-joiner.sh` (bake in
+  `OPENPAK_API=http://127.0.0.1:8099` + `OPENPAK_PHOTON_IP=127.0.0.1` on every
+  launch — the documented relaunch footgun; the host script also refuses to run if
+  the real production account file is active), and `send-test-invite.sh <CODE>`
+  (POSTs a correctly-formatted synthetic invite to the joiner pid directly, the
+  proven on-demand trigger that skips the host's GUI/MyPage flow). Later additions
+  from the same day: `setup-isolated-profiles.sh` + `mint-host-token.sh` (fully
+  isolated portable-mode profiles, see their headers) and `freeze-watchdog.sh`
+  (auto-gdb-backtrace when the host's log goes quiet while the process spins).
+- **Testing protocol (user rule, 2026-08-31): ALWAYS confirm the user is ready
+  before launching citron for testing.** Each instance holds ~6-9 GB resident;
+  two instances plus any other citron project (Among Us, CTR, Splatoon tests)
+  can push the 29 GB machine into swap-thrash, which has frozen the host
+  mid-MyPage-applet-load and forced a reboot. Before launching: `pgrep -x citron`
+  for other instances, `free -h` for headroom, then ask.
+
+**Not yet live-tested.** The watch-points for the first run, all in citron's log
+(`~/.local/share/citron/log/citron_log.txt` for the host, the joiner's own for the
+other):
+
+1. `[OpenPak][GUESTCALL] NetworkManager instance captured` shortly after the
+   joiner's Outbound boots (if this never appears, NetworkManager's Start/OnEnable
+   RVAs need re-checking — nothing else in the chain can work without it).
+2. `armed: joining room 'XXXXXX'` the moment an invite is popped.
+3. `firing Join(...)` then `Join returned state machine ...` then
+   `StartCoroutine returned -- injection complete` within the same second.
+4. Then the real join evidence: citron's `[OpenPak][PHOTON]` trace showing a
+   second client's GetRegions/Authenticate/JoinGame against the local server, and
+   `earlier-photon`'s trace logging `EnterRoom "<code>" actor=2` — actor=2 is
+   the first real second-player join this project has ever produced.
+
+Known risks to watch: the injected join runs from whatever screen the joiner is
+on (a multiplayer-menu screen is the sane test state; a mid-gameplay join may
+conflict with the game's own UI state); the `knownPlayers`/solo-host-timeout
+behavior only matters on the host side; and if the co-op tutorial gate (road
+barrier repair) applies to joining too, the joiner's save may need it done once.
+
 ## Security and repository rules
 
 - Never commit `openpak_account.txt`, session tokens, BAAS tokens, keys,
@@ -1329,3 +2337,21 @@ presence-based join work, or a real NPNS-equivalent push pipeline).
   <https://doc.photonengine.com/realtime/v5/realtime-intro>
 - earlier network:
   <archived external source>
+
+## Citron Launch Protocol (2026-08-31, family-wide)
+
+- The assistant may launch/kill/restart citron autonomously when either
+  (a) no other citron instance is running, or (b) the only running
+  instance is this project's own instance — identified by the Outbound
+  NSP path on the command line plus this project's `OPENPAK_*` env
+  vars — including closing and relaunching it to test freshly rebuilt
+  citron binaries.
+- ASK FIRST when any OTHER title's citron instance is running: Among
+  Us, Outbound, Fall Guys, CTR:NF, Stardew, MC and PvZ all share this
+  machine and the same citron build; a broad kill takes their session
+  down.
+- Detection: `pgrep -af "^~/REPOS/earlier-citron/build"`
+  and inspect each process's cmdline (NSP path) and environ
+  (title-specific `OPENPAK_*` vars).
+- Never broad-`pkill` citron patterns: they match the calling shell
+  itself and other titles' instances.
