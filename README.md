@@ -22,12 +22,16 @@ authentication. The existing provider rejects Citron’s replacement BAAS token.
 
 ## Status
 
-Research scaffold only. No local service listens yet. The App ID is now
-confirmed; App Version, authentication type, and required response fields are
-still unverified. The next milestone is a proof of concept using a separate
-Photon application and a OpenPak-controlled custom-authentication endpoint.
-We must not commit tokens, keys, account data, copyrighted game material or
-production infrastructure.
+Superseded research below; the live state is in [`HANDOFF.md`](HANDOFF.md).
+In short: Photon Cloud's built-in `NintendoSwitch` auth provider can never
+accept a replacement token, so the project runs Outbound against the
+self-hosted [`earlier-photon`](../earlier-photon) server (citron redirect
+`OPENPAK_PHOTON_IP`) plus the `legacy-local` account stack. Hosting a room,
+friend invitations and the joiner's injected join all work up to the session
+lobby; the remaining blocker is Fusion's client not sending `OpJoinGame`.
+Testing scripts live in `scripts/` (start with `start-services.sh`, then the
+two `launch-citron-*.sh` wrappers). We must not commit tokens, keys, account
+data, copyrighted game material or production infrastructure.
 
 ## Initial workflow
 

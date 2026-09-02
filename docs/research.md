@@ -114,16 +114,10 @@ Findings:
 
 ## Unknowns to resolve
 
-- Why Outbound's client fails against a healthy, correctly-configured test
-  app before Custom Authentication is invoked (see above)
-- App Version sent by the client (likely empty/default `"1.0"` based on the
-  serialized `PhotonAppSettings` asset — not yet confirmed on the wire)
-- Whether Outbound sends its custom-auth token as binary
-  `ClientAuthenticationData` or a string `ClientAuthenticationParams` param
-- Required successful-auth response fields beyond a stable user ID/token
-- Master/Game Server room and event behavior used by Outbound
-- Whether Photon Cloud is acceptable for proof-of-concept only and what a fully
-  self-hosted replacement would require
+All of the original unknowns were resolved by the self-hosted server work
+(root cause: Photon Cloud's built-in `NintendoSwitch` auth provider; the
+wire-level answers are in `HANDOFF.md`, "Root cause found" onward). The open
+items now live in `HANDOFF.md`'s latest dated section.
 
 ## Evidence rules
 

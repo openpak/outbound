@@ -1,17 +1,20 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-08-31. The joiner-side join trigger has been REBUILT from
-scratch as a clean manufactured guest-call facility (`core/legacy_guest_call`),
-after this session's static disassembly proved the previously-attempted CheckForInvite
-trampoline could never have worked even if it hadn't crashed: `NetworkManager.Join`
-only *constructs* the join coroutine and returns it — nothing ever calls
-`StartCoroutine` on it — and it also (a) copied the raw popped bytes (5-byte header
-included) as UTF-16 and (b) hardcoded one session's ASLR base. The new facility arms
-from the invite-mailbox pop, fires on the Unity main thread at the kernel scheduler
-boundary, chains `Join(code, false)` → `MonoBehaviour.StartCoroutine` (the exact
-two calls StartJoinOnLoad makes), and restores the guest context — no hand-assembled
-code, no mid-function frame assumptions, runtime-base-aware throughout. Not yet
-live-tested. See "2026-08-31" below for the full session.)
+Last updated: 2026-09-02 (evening). **Honest status: there is NO working
+two-player session yet.** The matchmaking JOIN HANDSHAKE now completes at the
+protocol level — the joiner reaches the room and the server records `actor=2,
+occupants=[1,2]`, repeatably — but the session then COLLAPSES ~120 s in every
+time (joiner freezes, host shows "connection interrupted (1020)"). The single
+remaining blocker is Fusion's real-time gameplay transport (PRUDP-Lite P2P +
+two-peer relay); see "NEXT SESSION" at the very end for the concrete plan.
+Earlier this session a full decompiled map of Outbound 0.6.0 was built
+(`/mnt/media/research/outbound/decomp`): the client is stock Photon
+Realtime v4 (Fusion fork), the GameList room-property contract was extracted
+byte-for-byte, and the
+live round is validation, not diagnosis (prediction: OpJoinGame fires after the
+GameList). Full flow + contract: the two 2026-09-02 sections at the end, and
+`earlier-photon/docs/protocol/06-fusion-session-join.md`. (Account server also
+moved to the legacy-local container stack; tokens re-minted; see below.)
 
 ## Objective
 
@@ -2277,9 +2280,10 @@ Supporting pieces:
 - The old DIAG block's hardcoded-VA capture (guest-side MailboxVA mirror write)
   was made base-aware; the disabled trampoline itself is untouched and stays off.
 - Env kill switch: `OPENPAK_NO_GUEST_JOIN=1` disables arming entirely.
-- **Scripts** (`scripts/`): `start-services.sh` (openpak-account with PORT=8099,
-  photon with DOTNET_ROLL_FORWARD=Major + the 27000/27001/27002 alt-port env vars,
-  both idempotent), `launch-citron-host.sh` / `launch-citron-joiner.sh` (bake in
+- **Scripts** (`scripts/`): `start-services.sh` (the legacy-local account
+  container on :8099 -- since 2026-09-01, see that section -- and photon with
+  DOTNET_ROLL_FORWARD=Major + the 27000/27001/27002 alt-port env vars, both
+  idempotent), `launch-citron-host.sh` / `launch-citron-joiner.sh` (bake in
   `OPENPAK_API=http://127.0.0.1:8099` + `OPENPAK_PHOTON_IP=127.0.0.1` on every
   launch — the documented relaunch footgun; the host script also refuses to run if
   the real production account file is active), and `send-test-invite.sh <CODE>`
@@ -2288,24 +2292,30 @@ Supporting pieces:
   from the same day: `setup-isolated-profiles.sh` + `mint-host-token.sh` (fully
   isolated portable-mode profiles, see their headers) and `freeze-watchdog.sh`
   (auto-gdb-backtrace when the host's log goes quiet while the process spins).
-- **Testing protocol (user rule, 2026-08-31): ALWAYS confirm the user is ready
-  before launching citron for testing.** Each instance holds ~6-9 GB resident;
-  two instances plus any other citron project (Among Us, CTR, Splatoon tests)
-  can push the 29 GB machine into swap-thrash, which has frozen the host
-  mid-MyPage-applet-load and forced a reboot. Before launching: `pgrep -x citron`
-  for other instances, `free -h` for headroom, then ask. ENFORCED IN CODE: both
+- **Testing protocol (user rule, 2026-08-31 — AUTHORITATIVE VERSION: "Citron
+  Launch Protocol (family-wide)" at the end of this document, mirrored in
+  `~/REPOS/legacy-docs/shared-docs/emulator-launch-protocol.md`): ALWAYS confirm
+  the user is ready before launching citron for testing, and ASK FIRST when any
+  OTHER title's instance is running.** Each instance holds ~6-9 GB resident; two
+  instances plus any other citron project can push the 29 GB machine into
+  swap-thrash, which has frozen the host mid-MyPage-applet-load, forced a reboot,
+  and starved the joiner's Fusion connect mid-handshake (1029 major-faults/5s
+  observed — mimics a protocol stall). Before launching: `pgrep -x citron` for
+  other instances, `free -h` for headroom, then ask. ENFORCED IN CODE: both
   `launch-citron-*.sh` scripts abort if a foreign citron instance (any cwd outside
   this project's profiles) is running — learned the hard way after launching blind
   next to a running CTR session.
 
-**Not yet live-tested.** The watch-points for the first run, all in citron's log
-(`~/.local/share/citron/log/citron_log.txt` for the host, the joiner's own for the
-other):
+**Live-tested 2026-09-01 (multiple rounds) — see the 2026-09-01 section at the end
+for results and the remaining blocker.** The watch-points for the first run, all
+in each instance's own portable-profile log
+(`~/.local/share/earlier-outbound/citron-{host,joiner}/user/log/citron_log.txt`):
 
 1. `[OpenPak][GUESTCALL] NetworkManager instance captured` shortly after the
    joiner's Outbound boots (if this never appears, NetworkManager's Start/OnEnable
    RVAs need re-checking — nothing else in the chain can work without it).
-2. `armed: joining room 'XXXXXX'` the moment an invite is popped.
+2. `armed: joining room 'XXXXXX'` when the joiner ACCEPTS the invite toast
+   (record-then-accept, see 2026-09-01; delivery alone only records it).
 3. `firing Join(...)` then `Join returned state machine ...` then
    `StartCoroutine returned -- injection complete` within the same second.
 4. Then the real join evidence: citron's `[OpenPak][PHOTON]` trace showing a
@@ -2367,3 +2377,451 @@ instance, kill ONLY pids whose cmdline contains THIS project's game
 NSP path (check /proc/<pid>/cmdline per pid). When any other title's
 instance is running, ask before launching or killing anything — memory
 pressure alone (29 GB host) can OOM a foreign session.
+
+### 2026-09-01: joiner reaches the session lobby; GameList property typing; record-then-accept flow; launch-script guards
+
+Round-trace analysis of the latest invite attempt (host room alive, joiner
+authenticated, joined the session-code lobby, received the GameList event with
+the host's live session — and then went silent: **no OpJoinGame was ever sent**,
+Fusion's StartGame timed out, and the joiner showed its generic join-failure
+screen while the host's room sat at actor=1 until eviction). Two server-side
+defects were found and fixed in `earlier-photon` `MasterServerHandler`:
+
+1. **Property value typing.** The GameList entry was built with byte-typed
+   values for IsOpen/IsVisible (bool is required) and ClampToByte'd
+   PlayerCount/MaxPlayers (int is required). Photon Realtime's
+   `RoomInfo.CacheProperties` reads `IsOpen = (bool)properties[254]`,
+   `MaxPlayers = (int)properties[255]`, etc. — a boxed byte fails the bool/int
+   unbox, the exception kills the client's event dispatch, the cached session
+   list stays empty, and Fusion's wait times out. Fixed: bool/bool/int/int.
+2. **Key 250 passthrough.** The host's stored GameProperties include
+   `250(Byte)=1` (the CustomProperties marker key with a byte value).
+   `RoomInfo.CacheProperties` treats key 250 as the room's CustomProperties
+   hashtable — merging a byte instead of a dictionary breaks the client's
+   property cache again. Key 250 (plus 248/243 server-internal keys) is now
+   excluded; the custom STRING/INT props (scene/vehicleType/version/
+   knownPlayers) still pass through for the game's own session filter.
+3. **Dual event codes.** The GameList is now raised under BOTH 230 (Fusion's
+   fork: full list) and 229 (GameListUpdate; also what vanilla Photon Realtime
+   clients dispatch) so a PC test harness using stock Photon Realtime sees the
+   same list the game build sees.
+
+**Joiner flow restructured (record-then-accept).** The cmd-141 raw ctx handler
+(`TryPopFriendInvitationNotificationInfo` in citron's
+`application_functions.cpp`) now only RECORDS the invitation (room code + the REAL requesting
+guest thread via `ctx.GetThread()` — the D<>/cmif path runs on a ServerManager
+host thread whose GetCurrentThreadPointer is a per-thread DUMMY KThread, which
+is why every earlier arm silently never fired). The injection arms only when
+the user ACCEPTS the invite by clicking the GAME INVITE toast while Outbound
+is running (5-minute recording window; fresh guest-thread pointer maintained
+by the 37/s poll). Rationale: auto-firing on delivery joined from whatever
+screen the joiner was on — the title/main menu crashes the join coroutine
+(observed live twice: guest svcBreak, "An error has occurred" screen).
+
+Joiner-side state at last trace: injection complete, client authenticated on
+NameServer + Master, joined the session-code lobby (OpJoinLobby 229 with the
+room code as P213), GameList delivered — and the client still waits instead of
+sending OpJoinGame(226). Next diagnostic: the PC harness (PhotonClient.dll —
+the game's own bundled client) running the same flow on the host PC with
+Fusion's debug output visible, to name what the client-side wait still needs.
+The host's own 1020 after ~2-4 min solo (invited-nobody timeout, client-side)
+remains the window the joiner must land within.
+
+Housekeeping: `launch-citron-*.sh` now REFUSE to launch while a foreign
+citron instance is running (any cwd outside this project's profiles), with a
+`CITRON_ALLOW_FOREIGN=1` override; the NameServer now hands loopback peers the
+loopback Master address (`127.0.0.1:27001`) so PC-side test clients are not
+routed to the real Cloud (GetRegions + both auth paths). The family-wide
+launch/kill rules live in the user's Citron Launch Protocol section above and
+`~/REPOS/legacy-docs/shared-docs/emulator-launch-protocol.md`.
+
+**Account server moved to the legacy-local stack (2026-09-01, after the last
+test).** The earlier rounds ran against an ad-hoc `go run .` of openpak-account
+on :8099; that process is gone and :8099 is now the `legacy-local_account_1`
+container (`~/REPOS/legacy-local`, `podman-compose`). Consequences, all handled:
+
+- The container signs with the stack's own `OPENPAK_SECRET` (raw bytes from
+  `legacy-local/.env`, not the hex `legacy_secret.key`), so every profile
+  token minted before the move was rejected (401). `mint-host-token.sh` now
+  reads the stack's `.env` + `data/account/accounts.json`; both profiles were
+  re-minted (`TARGET_PID=1800000004` for the joiner) and verified 200 on
+  `/api/me`. `setup-isolated-profiles.sh` mints the joiner the same way instead
+  of copying the old `~/.citron-second` file.
+- A real legacy-local bug found on the way: `compose.yml` set
+  `OPENPAK_DATA_DIR=/data`, but the server only reads `OPENPAK_DATA` (a file
+  path) and otherwise uses `accounts.json` in its cwd (`/`), so the container had
+  loaded an EMPTY store -- valid tokens failed with "Compte introuvable", and any
+  registration would have landed in the ephemeral container fs. Fixed to
+  `OPENPAK_DATA: /data/accounts.json` and the account container recreated
+  (`podman-compose up -d --no-build account`). This affected every title using
+  the stack, not just Outbound.
+- `start-services.sh` now checks `/api/health` on :8099 and brings the stack up
+  with `podman-compose` instead of launching `go run .`; `send-test-invite.sh`
+  defaults its token to the HOST PROFILE file (it pointed at the main
+  `~/.config/citron` profile before).
+
+### 2026-09-02: full decompiled map instead of per-hypothesis disassembly; tmpfs incident
+
+Decision (user): stop chasing one function per hypothesis and map the whole
+binary once, searchably, so future work reads the game's real code path and
+guesses only about server behaviour. Built with
+`~/outbound-re/ghidra_scripts/build_map.py` (+ `make_xrefs.py`, `annotate.py`);
+outputs live on the pool at `/mnt/media/research/outbound/decomp/`
+(README inside; linked as `~/outbound-re/map`). Copyrighted derivative --
+never enters a repo. The procedure and its traps are in
+`~/REPOS/legacy-docs/IL2CPP-GHIDRA-WORKFLOW.md`, Step 5.
+
+- `index/methods.tsv` (234,785 methods, RVA + signature), `index/strings.tsv`
+  (33,452 literal slots), `index/xrefs.tsv` (493,616 direct `bl` calls,
+  callee -> caller), and one decompiled `.c` per class under
+  `<NamespaceRoot>/`. Priority order: Fusion / Photon / NetworkManager /
+  friends / invite / session classes first, then everything.
+- First answer it gave for free: `NetworkManager$$Join` has exactly two
+  callers, `JoinUI$$OnJoin` and `DebugNetworkConnect$$Join` -- the injected
+  join is the same entry the manual-code UI uses, nothing else.
+- Next use: read Fusion's session-list / `OpJoinGame` decision path in the
+  `Fusion/` and `Photon.Realtime/` files to name what the joiner still waits
+  for after the GameList (the open blocker from 2026-09-01), before another
+  live round.
+
+Housekeeping the same morning: the shell tool died for every command because
+`/tmp` (15 GB tmpfs) was full -- three 4 GB guest-memory dumps from another
+session's scratch. Moved to `/mnt/media/research/tmp-rescue/`. All
+service logs and the freeze watchdog now write under
+`/mnt/media/research/outbound/services/` (`OUTBOUND_RUN_DIR`), never
+`/tmp`; playbook §5 updated.
+
+### 2026-09-02 (cont.): full client flow reconstructed from the map — server contract verified without a live test
+
+Using the decompiled map (`/mnt/media/research/outbound/decomp`), the
+joiner's entire Photon dialogue was reconstructed from Outbound's own code. The
+client is **stock Photon Realtime v4 (Fusion fork)** — `LoadBalancingClient`
+with the standard method set (`ConnectToNameServer`, `OpGetRegions`,
+`ConnectToRegionMaster`, `CallAuthenticate`, `OpJoinLobby`, `OpJoinRoom`,
+`OnOperationResponse`/`OnStatusChanged`/`OnEvent` jump-table dispatch). So the
+whole flow is the documented LoadBalancing sequence; only the room-property
+contract and the session-name path are game-specific, and both are now pinned
+from the binary.
+
+**Connection/session sequence (each step = one op the server must answer):**
+
+1. NameServer: `OpGetRegions` (220) → region list; `Authenticate` (230) with
+   the custom-auth token → returns the Master address + Secret (param 221).
+2. Master: reconnect, `Authenticate` (230) again (Secret echoed) → ready.
+3. `OpJoinLobby` (229) with **P213 (LobbyName) = the session code** (observed
+   live 09-01). Server answers, then must raise the **GameList event (230),
+   param 222 = `{ roomName -> propertiesHashtable }`**.
+4. Client caches each room via `RoomInfo.InternalCacheProperties` and, when the
+   room named after the code is present + open, sends `OpJoinGame` (226) with
+   that name → Master returns the GameServer address.
+5. GameServer: reconnect, `Authenticate` (230), `OpJoinGame` (226) again →
+   EnterRoom success (actor list, room props) → **InRoom**, actor=2.
+
+**The GameList room-property contract — extracted byte-for-byte** from
+`RoomInfo$$InternalCacheProperties` (RVA 0x218cb30) and the getters
+(`get_IsOpen`@0x218d5b0 reads +0x38, `get_IsVisible`@0x218d5c0 reads +0x39,
+`get_MaxPlayers`@0x218d5a0 reads +0x20, `get_PlayerCount`@0x218d580 reads
++0x58). Each room's value Hashtable is parsed with these well-known byte keys:
+
+| Key | Meaning | Client read | Type rule |
+|---|---|---|---|
+| 251 | RemovedFromList | bool → drops the room if true | **strict bool** (wrong type throws) |
+| 255 or 243 | MaxPlayers | `Convert.ToInt32` → +0x20 | byte OR int OK |
+| 254 | **IsVisible** | bool → +0x39 | **strict bool** |
+| 253 | **IsOpen** | bool → +0x38 | **strict bool** |
+| 252 | PlayerCount | `Convert.ToInt32` → +0x58 | byte OR int OK |
+| 249 | (bool field +0x3a) | bool | **strict bool** |
+| 248 | MasterClientId | int32 → +0x48 | int |
+| 250 | ref/object → +0x50 | `as`-cast (null if wrong) | not strict |
+| other string keys | custom props | `MergeStringKeys` | string-keyed only |
+
+A strict-bool key sent as a byte throws `InvalidCastException` **inside the
+client's event dispatch**, which silently empties the cached room list and
+times the join out — this is exactly the 09-01 "authenticated + JoinLobby then
+nothing, `Invalid session ID`" symptom.
+
+**Verified against `earlier-photon`:** `MasterServerHandler.BuildFusionSessionLobbyEvent`
+already emits `IsOpen`(253)=bool, `IsVisible`(254)=bool, `PlayerCount`(252)=int,
+`MaxPlayers`(255)=int and strips the host's byte-typed well-known keys. **The
+key numbers and types match Outbound's Fusion fork exactly** (note: Fusion's
+253/254 are swapped vs vanilla PUN, and the server correctly follows Fusion).
+So the 09-01 fix targets the precise cause and the contract is now satisfied.
+
+**Conclusion (no test needed to reach it):** the property-typing blocker is
+closed in code; the next live round is validation, not diagnosis, and the
+prediction is `OpJoinGame` (226) now fires after the GameList. If it still
+stalls, the map narrows it to two remaining, code-identified suspects:
+
+1. **Room-name identity.** The joiner searches for a room whose name equals the
+   Fusion session name (the code, upper-cased by `Join`). The server keys the
+   advertised room by the `OpJoinLobby` LobbyName (P213). Confirm the host
+   registered the room under that same exact string (case included), or the
+   client's wait never matches.
+2. **Defensive:** `BuildFusionSessionLobbyEvent` strips keys 250/248/243 but
+   not **251 (RemovedFromList)** — if a host ever stored 251 truthy it would
+   drop the room. Add 251 to the strip list.
+
+The Fusion state gate `<Join>b__0` (0x1bfdfa0) is only a runner-state bitmask
+(`state & 0x1600000`), not a room-content check — room matching is inside
+Fusion's own matchmaking, driven entirely by the GameList contract above.
+
+### 2026-09-02 (cont.): why the HOST drops with "connection interrupted (1020)" after the invite — root-caused from the decompile + server config
+
+The map answered this. `NetworkManager$$OnDisconnectedFromServer` (RVA 0x1BF92E0)
+shows the host teardown is **reactive, not a self-timer**: it takes the Photon
+`DisconnectCause` (a uint8), maps causes 2-6 through a small rodata table
+(0x518B528) into a `NetworkPlatformFailedReason` (default `Unknown`=16), calls
+`set_CurrentFailedReason` → `NetworkManager$$Shutdown` (0x1BFA5C0), and shows the
+generic "connection interrupted" screen. So the host does **not** quit on an
+"invited nobody" timer of its own — it is reacting to the server closing its
+peer. ("1020" is Outbound's own generic connection-error display, not a Photon
+StatusCode: StatusCode is 1022-1051, DisconnectCause 0-20, ShutdownReason 0-21 —
+none is 1020.)
+
+That pointed straight at the server, and the cause is a **misconfigured
+dead-peer timeout**:
+
+- `BlackIce.Server.Core` evicts any peer with no *inbound* datagram for
+  `Server:Listener:DeadTimeoutSeconds`, which **defaults to 120 s**
+  (`ServerOptions.cs`). `UdpListener.RunMaintenance` pings quiet peers, and a
+  live client answers (refreshing `LastInboundUtc`) — but while the **Invite
+  Friends system applet is open the game is suspended**, so the host stops both
+  sending and answering pings. At 120 s of silence the server evicts it.
+- `start-services.sh` tried to raise this to 600 s but used
+  `Listener__DeadTimeoutSeconds=600` — the config reader only honours the
+  **`BLACKICE_` prefix** and binds `ServerOptions` under `Server`
+  (`ServerConfig.cs`, `.AddEnvironmentVariables(prefix:"BLACKICE_")`), so the
+  correct key is **`BLACKICE_Server__Listener__DeadTimeoutSeconds`**. The
+  mis-prefixed var was silently dropped and the server ran on the 120 s default —
+  which is exactly the observed ~2-4 min solo/after-invite death.
+
+**Fix applied:** `start-services.sh` now sets
+`BLACKICE_Server__Listener__DeadTimeoutSeconds=600` (the port vars were already
+correctly `BLACKICE_Server__Ports__…`). Takes effect on the next earlier-photon
+restart — the currently-running instance still has the 120 s default. A cleaner
+follow-up (not required for the fix) is to keep a host peer alive across applet
+suspension, e.g. hold its slot while the room has a live registration rather than
+evicting purely on inbound silence.
+
+
+**Durable server fix (implemented + unit-tested, `earlier-photon`):** rather
+than rely on a fixed timeout the applet can outlast, `BlackIce.Server.Core`'s
+listener now keys the eviction grace to session stage —
+`UdpListener.EvictionGrace(status)` returns `InRoomDeadTimeoutSeconds`
+(default 1800 s) for `SessionStatus.InRoom` peers and `DeadTimeoutSeconds`
+(120 s default, 600 s via env) for pre-room peers; `ServerOptions` validates
+InRoom >= base; `KeepaliveTests.EvictionGrace_gives_in_room_peers_the_longer_timeout`
+covers it (16/16 pass). earlier-photon was restarted so both the 600 s base and
+the in-room grace are live. A host suspended by the Invite Friends applet is no
+longer evicted mid-invite. Also fixed a self-matching `pgrep -f "BlackIce.Server.Host"`
+in `start-services.sh` (it matched this shell and skipped the restart); it now
+keys off the :27000 listen port.
+
+### 2026-09-02 (cont.): first live host+join round — hosting works, native invite applet crashes citron; profiles consolidated to two shared personas
+
+Ran host+joiner on citron (server fixes live). Results:
+
+- **Hosting works end to end.** The host created and entered its room —
+  `EnterRoom "P6HBNE" actor=1` — through the full NameServer→Master→GameServer
+  flow with correct auth and GameProperties. The server's Fusion GameList event
+  and the 09-02 property contract behaved as designed.
+- **The native Invite Friends applet crashes citron** with a SIGSEGV
+  (`segfault at e0`, unhandled SIGSEGV at rip `0x1fa6678`) the instant it loads
+  system title `0100000000001013`. This is a **citron-side crash in the applet
+  path**, not our server and not the join logic — a long-standing instability in
+  this project's invite history. Workaround unchanged: skip the native button and
+  deliver invites synthetically via `scripts/send-test-invite.sh <CODE>`.
+- Decision (user): after confirming host+join on citron via the synthetic path,
+  **move testing to Ryujinx** — a different emulator that may not hit this
+  applet crash at all (an emulator gap, per the playbook's differential rule).
+  The Stardew agent adapts the Ryujinx side; this repo's citron rig stays as the
+  fallback.
+
+**Profile consolidation (this session).** Per user direction, citron no longer
+uses a profile/account per game. There are now **two shared personas** — host
+and joiner — reused by every `*-legacy` title:
+
+- Profiles moved to `~/.local/share/citron/{host,joiner}` (was
+  `earlier-outbound/citron-{host,joiner}`); keys/firmware/content/tokens
+  preserved by the move, both still 200 on `/api/me`.
+- Shared launchers live in `shared-docs/scripts/` (`launch-citron.sh` engine +
+  `launch-citron-{host,joiner}.sh`), reachable from any repo via its
+  `shared-docs/` symlink. Outbound's `scripts/launch-citron-{host,joiner}.sh` are
+  now two-line wrappers that add `OPENPAK_PHOTON_IP` and call the shared ones.
+- Accounts `OutboundHost`/`OutboundJoiner` are the generic host/joiner identities
+  for all titles. `setup-isolated-profiles.sh` still seeds Outbound's own content
+  into the shared profiles (it is the Outbound content-seeder, not a per-game
+  profile builder). Convention documented in `shared-docs/citron-isolation.md`
+  §1/§3 and `shared-docs/conventions.md`.
+
+### 2026-09-02 (cont.): join HANDSHAKE reaches actor=2 (NOT a working session). Root cause was dropped custom props (version), not the typing.
+
+The join HANDSHAKE completes (the session then collapses ~120 s in — see the
+later sections). Live result (citron host + citron joiner, injection-driven):
+
+```
+16:13:37 joiner OpJoinLobby "6S8GEE"
+16:13:37 server GameList(222)={"6S8GEE"={253=true,254=true,252=1,255=4,
+                 "scene"="startingLevel","vehicleType"=3,"knownPlayers"="","version"="1.1.7"}}
+16:14:01 joiner OpJoinGame "6S8GEE"      <-- the op that NEVER fired before
+16:14:02 GameServer EnterRoom "6S8GEE" actor=2 occupants=[1,2]
+         joiner then sends 127+ RaiseEvents — real gameplay sync
+```
+
+**Real root cause (corrects the earlier 09-02 "typing fix closes it" over-claim):**
+the property TYPING was necessary but NOT sufficient. The joiner cached the room
+but its GameList entry carried only the four well-known keys — the host's custom
+props (`scene`, `vehicleType`, `knownPlayers`, and especially **`version`**) were
+missing. The host lists those under key 250 for the lobby to advertise, and
+**Fusion will not join a session whose `version` it cannot match**, so it cached
+the room and stalled, never sending OpJoinGame.
+
+Why they were missing: `GameServerHandler.EnterRoom` built its own minimal game
+properties and **threw away the host's incoming `GameProperties(248)`**, and the
+Master GameList builder read the byte-keyed `Room.Properties` dict, which
+structurally cannot hold the string custom keys (`"version"`).
+
+**Fix (validated):**
+1. `EnterRoom` now persists the creator's `GameProperties(248)` via
+   `room.SetProperties(null, …)` into the object-keyed store (handles string keys).
+2. `BuildFusionSessionLobbyEvent` reads `room.GameProperties` (object-keyed)
+   instead of `room.Properties`, so `version`/`scene`/etc. pass through into the
+   advertised GameList. The existing exclude list still drops the byte
+   server-internal keys.
+
+**Emulator notes from the same session:**
+- **Ryujinx runs Outbound and HOSTS cleanly** — the `*photonengine.io*=127.0.0.1`
+  route in `openpak_routes.env` redirects Photon's UDP to our server (route
+  table works for UDP), full NameServer→Master→GameServer host flow, no crash.
+  The citron native Invite-Friends applet SIGSEGV does not occur on Ryujinx.
+- **Ryujinx cannot JOIN:** no invite applet, the Switch build's invite→join path
+  is the broken empty-`PlatformSessionID` one, and Ryujinx has no call-injection
+  facility. So the joiner must be citron (guest-call injection). Host may be
+  either; hosting on Ryujinx avoids the citron applet crash.
+- The host's own ~120s "hosting alone" OpLeave is Outbound's client-side timer
+  (it was actively simulating and getting event echoes the whole time — not a
+  missing server heartbeat); a real second player joining within the window
+  satisfies it. Our server dead-timeout (600s base / 1800s in-room) is unrelated.
+
+### 2026-09-02 (cont.): join HANDSHAKE reaches actor=2 repeatably, but NO working session (collapses ~120s in)
+
+**Be precise about what works:** the JOIN HANDSHAKE completes (server logs
+`actor=2, occupants=[1,2]`, events flow briefly), repeatably — but the session
+is NOT playable: both peers fail ~120 s later. Do not call this a "working
+two-peer join". What actually improved:
+
+- **Join handshake reaches actor=2 repeatably.** On fresh instances, via both the
+  synthetic invite and the **native Invite-Friends applet** (the applet DOES
+  deliver a valid room code and fire the injection — earlier "nothing happened"
+  was the stuck-stage bug below, not the applet). Before the GameProperties fix
+  the joiner stalled at OpJoinLobby and never got this far.
+- **Server join fix (validated):** advertising the host's custom props
+  (`version`/`scene`) in the lobby GameList is what makes Fusion send OpJoinGame.
+- **citron injection recovery (fixed):** the injection state machine got stuck at
+  `Stage::Coroutine` when an injected join hung mid-coroutine (game degraded), so
+  every later invite was refused "already running". `ArmPendingInvite` now
+  force-resets a stuck stage on a fresh invite (`legacy_guest_call.cpp`), so
+  joins retry without a full citron restart.
+- **citron `F_GETFL` assert relaxed:** `bsd.cpp` FcntlImpl GETFL no longer
+  `ASSERT(arg==0)` (Fusion passes a non-zero arg during transport socket setup).
+
+**The one remaining blocker — Fusion real-time gameplay transport.** After the
+join, both peers enter the live session and ~120 s later the joiner FREEZES and
+the host times out (1020). Root causes, both confirmed this session:
+1. **PRUDP-Lite P2P socket block.** Each peer binds a second UDP socket
+   (`UNCONN 0.0.0.0:<ephemeral>`) for Nintendo's PRUDP-Lite P2P/NAT-punch
+   discovery and blocks forever on its `recvfrom()` (citron's bsdsocket is
+   single-threaded, so the whole game freezes). citron only *decodes*
+   PRUDP-Lite (`DescribePrudpLite`); it does not bridge the two local peers'
+   P2P sockets.
+2. **Two-peer Fusion relay (event 101).** The server answers the relay
+   Connect with a **solo-host self-loopback** `NetCommandAccepted`
+   (`GameServerHandler` 101 handler) and relays 101 DATA to other actors only
+   when `Session.Count>1`, but correct two-peer NetSocketRelay addressing
+   (per-peer `NetConnectionId` Group/GroupIndex/Generation) is under-specified.
+
+**Why it's not a one-shot fix:** the two-peer relay addressing needs
+ground-truth from an actual two-peer exchange (all prior captures were solo
+host). We can now GENERATE that (joins are repeatable), so the concrete next
+step is to capture what the two peers exchange over 101 + PRUDP-Lite in the
+~120 s before timeout and implement the addressing/bridge from it — the same
+observe-then-implement loop used all project, not guesswork on the relay code.
+
+## NEXT SESSION — concrete plan (Fusion gameplay transport)
+
+**Goal:** a session that actually holds past ~120 s with two players, i.e. fix
+the transport, not the join (the join handshake already reaches actor=2). Do NOT
+declare progress on the strength of `actor=2` in the server log — that is the
+handshake, not gameplay. The success criterion is: both peers stay in the room
+and keep exchanging 101 traffic well past 120 s, with the joiner NOT frozen.
+
+### 0. Environment (unchanged, all working)
+- Services: `scripts/start-services.sh` (legacy-local account container :8099,
+  photon `dotnet run` on 27000-27002 with the 600 s / 1800 s timeouts).
+- citron: shared personas `~/.local/share/citron/{host,joiner}` via
+  `scripts/launch-citron-{host,joiner}.sh`. Both sign into OutboundHost/Joiner.
+- Join trigger: host a session (NEVER click the native Invite-Friends applet on
+  citron — SIGSEGV), then `scripts/send-test-invite.sh <CODE>` and accept the
+  toast on the joiner. The room code is in photon log `EnterRoom "<code>" actor=1`.
+- Rebuilt binary picks up the two citron fixes (injection stuck-stage reset,
+  `F_GETFL` assert) — relaunch citron after any `ninja citron citron-cmd`.
+
+### 1. FIRST: capture two-peer ground truth (we can finally generate it)
+All prior transport work was reverse-engineered from a SOLO host. Now that the
+handshake reaches actor=2, do a real two-peer run and capture what the peers
+exchange in the 120 s before the timeout — this is the missing input for the
+relay addressing. From EACH citron log (`user/log/citron_log.txt`), collect:
+- Every `[OpenPak][PHOTON]` line with `type:11` / event-code 100 & 101 to
+  :27002 (the Fusion relay), both TX and RX, both peers.
+- The PRUDP-Lite socket: `ss -tunap | grep <pid>` gives the `UNCONN
+  0.0.0.0:<port>` P2P socket; capture what (if anything) each peer sends to the
+  other's P2P port, and what `DescribePrudpLite` logs for each.
+Save raw captures OUTSIDE the repos (pool: `/mnt/media/research/outbound/`).
+
+### 2. Blocker A — PRUDP-Lite P2P socket freeze (the joiner freeze)
+Each peer binds `UNCONN 0.0.0.0:<ephemeral>` for Nintendo PRUDP-Lite P2P and
+blocks forever on `recvfrom()` (single-threaded bsdsocket → whole game freezes).
+Proven earlier: sending a *valid* PRUDP-Lite `SYN`+`CONNECT` from a PERSISTENT
+socket releases it and advances the client; 16 zero bytes releases it but the
+game then shuts down (invalid). Plan:
+- Implement a PRUDP-Lite P2P **bridge in citron** (`bsd.cpp`, next to
+  `DescribePrudpLite`): when a peer sends a PRUDP-Lite packet to its intended P2P
+  destination, forward it to the OTHER local peer's P2P socket (both are on
+  127.0.0.1; the two peers are separate citron processes, so bridge via a small
+  shared channel — a loopback relay port, or a file/UDS the two citrons agree on
+  via an env var). Simplest first cut: a tiny UDP relay both citrons forward
+  their PRUDP-Lite traffic through, keyed by the room.
+- Alternatively/first: make the recvfrom non-blocking so the game doesn't freeze,
+  and see whether it falls back to relay-only — but earlier evidence says it
+  needs the P2P to succeed, so a bridge is likely required.
+
+### 3. Blocker B — two-peer Fusion relay (event 101) addressing
+`GameServerHandler` answers the relay Connect with a **solo-host self-loopback**
+`NetCommandAccepted` and only relays 101 DATA to other actors when
+`Session.Count>1`. For two peers this is wrong: each peer needs a distinct
+`NetConnectionId` (Group/GroupIndex/Generation), and the Accepted must hand each
+peer the OTHER's id so the relay can route between them. Implement from the §1
+capture:
+- Decode both peers' `NetCommandConnect` (their UniqueIds) and give each a
+  distinct connection id; reply `NetCommandAccepted` with the real remote id
+  (not the {0,0,1} self-loop) — see `FusionRelayProtocol` / `FusionProtocol.cs`.
+- Forward each peer's ongoing 101 DATA to the OTHER peer with the correct
+  source/target ids (not echo-to-sender). Add fixtures like
+  `FusionRelayProtocolTests` from the captured two-peer bytes.
+- Expect to also need `ReflexiveInfo`/`PlayerRefMapping`/`ChangeMasterClient`
+  (HANDOFF "Next step" pt 3) once basic routing works.
+
+### 4. Validate
+Two-peer run; success = both stay in-room exchanging 101 past 120 s, joiner not
+frozen (`ss` shows no stuck `UNCONN recvfrom`; joiner log keeps advancing). Only
+then is any "two-player" claim honest.
+
+### Uncommitted at session end (commit under <user-a>, per-repo, NO AI attribution)
+- `earlier-photon`: GameProperties store+advertise (the validated join fix),
+  the 251-strip, the in-room eviction grace, the dead-timeout env doc.
+- `earlier-citron`: `legacy_guest_call.cpp` injection stuck-stage reset;
+  `bsd.cpp` `F_GETFL` assert relaxed.
+- `earlier-outbound`: HANDOFF, README, research.md, scripts/ (shared-persona
+  wrappers), start-services env fix.
+- `shared-docs`: `scripts/launch-citron*.sh`, citron-isolation/conventions/README
+  (two-persona model); `earlier-photon/docs/protocol/06-fusion-session-join.md`.
