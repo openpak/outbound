@@ -1,7 +1,11 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-09-02 (evening). **Honest status: there is NO working
-two-player session yet.** The matchmaking JOIN HANDSHAKE now completes at the
+Last updated: 2026-09-02 (night). **BREAKTHROUGH: a real two-player Outbound session ran
+for ~2 minutes** — both peers spawned into the game and authored state through our self-hosted
+Fusion server — after rebuilding fusion-libs from Fusion 2.0.8 (Outbound's exact version). The
+2.1.2 SDK's V2/250 transport was the wall; 2.0.8 uses NotifyData(3) which the client reads. Both
+clients then went quiet ~2 min in (joiner timed out client-side) — the remaining issue is session
+CONTINUITY, not entry. See the 2026-09-02 (night, FIXED) section. The matchmaking JOIN HANDSHAKE now completes at the
 protocol level — the joiner reaches the room and the server records `actor=2,
 occupants=[1,2]`, repeatably — but the session then COLLAPSES ~120 s in every
 time (joiner freezes, host shows "connection interrupted (1020)"). The single
@@ -2747,13 +2751,353 @@ step is to capture what the two peers exchange over 101 + PRUDP-Lite in the
 ~120 s before timeout and implement the addressing/bridge from it — the same
 observe-then-implement loop used all project, not guesswork on the relay code.
 
+### 2026-09-02 (night): the two-peer capture EXISTED already, and it rewrites the diagnosis — the missing piece is a Fusion Shared-mode SERVER, not P2P/relay addressing
+
+Re-read the previous 18:10 run (photon log `earlier-photon.log`, room `34Y4LE`, host
+`:37380` actor 1, joiner `:60607` actor 2) instead of re-running it. The capture already
+contained the two-peer ground truth §1 asked for, and both "blockers" in the plan above are
+wrong:
+
+- **Blocker A (PRUDP-Lite recvfrom freeze) is dead.** The joiner citron log for that run has
+  ZERO `prudp`/`raw[` lines and no blocked socket; the `SOCK_NONBLOCK` fix of 08-29 already
+  removed that freeze. The "joiner freezes" observation is the game's own reaction to the
+  collapse below, not a socket block.
+- **Blocker B (two-peer relay addressing) is a misdiagnosis.** Neither peer ever addresses the
+  other. Every code-101 packet from BOTH peers is `OpRaiseEvent` with `ActorList(252)=[0]`,
+  i.e. target actor 0. Decompiled Fusion (`NetSocketRelay.Send` → `SendPackage(101,
+  address.ActorId, …)`, `CloudCommunicator.OnEvent` → `PushPackage(evt.Sender, …)`) plus
+  `CloudServices.HandleStartMessage`: in `GameMode.Shared` the client does exactly ONE
+  `Connect(NetAddress.FromActorId(0))`. Actor 0 is the Photon Cloud **Fusion plugin**, which
+  in Shared mode is a real Fusion SERVER simulation, not a relay.
+- **What actually collapses, with timestamps:** joiner `EnterRoom actor=2` 18:10:44.87; joiner
+  relay `Connect` 18:10:45.27 (our server answers the solo-host `Accepted`); the 14-byte
+  `04 00…` frames from both peers are `NetPacketType.NotifyAcks` keepalives (Outbound's own
+  enum from the IL2CPP dump: `NotifyData=3, NotifyAcks=4`; layout `NetNotifyHeader` = type,
+  fragment, seq u16, ackSeq u16, ackMask u64 = 14 B). Once `Session.Count==2` our server stops
+  echoing them back and cross-relays them instead (sender 1↔2, addresses neither peer has a
+  connection for → dropped). 15 s later, 18:10:59.86, the host sends command 4 =
+  `NetCommands.Disconnect` (reason 2 = Timeout) and the joiner follows 100 ms later. The
+  OpLeaves at 18:12:09 (host) / 18:12:43 (joiner) are the game giving up. So the session never
+  lived 120 s: the relay link died at +15 s; the solo-host "echo" hack only ever worked because
+  a client happily accepts its own keepalives as the server's.
+- **Why the echo can't be extended:** a Shared-mode client sends its state (NotifyData) to
+  actor 0 and expects a Fusion server to (a) run the V2 notify transport (acks/windows),
+  (b) hold the object state words and replicate them to the other client, (c) allocate
+  PlayerRefs, send `PlayerRefMapping`, drive `RuntimeConfig`, state-authority transfer, master
+  client. Outbound's game code is deeply Shared-mode (`RequestStateAuthority`,
+  `IsSharedModeMasterClient`, `HasStateAuthority` all over `NetworkPlayer`/`NetworkManager`),
+  so flipping the game to Host/Client mode via injection is a dead end too.
+- **Photon Server v5 (user's links) is not a shortcut:** per Photon staff on the (now
+  read-only) forum, the FusionPlugin is not shipped in the Server SDK and runs only on Photon
+  Cloud; Photon Server itself is Windows-only and license-gated. Its Plugins API is only useful
+  as a reference for what the plugin does.
+
+**The path that works (spiked tonight, outside the repos in `~/photon-oracle/fusionhost/`):**
+Fusion.Runtime.dll's OWN `Simulation.Server` class contains the Shared-topology server code
+(`RecvPacket → ReadStateTick + StateReplicator`, `CreateRuntimeConfiguration`,
+`RegisterUniqueIdPlayerMapping`), i.e. the cloud plugin is that class hosted headless. Hosting
+it on plain .NET needs no Unity:
+
+1. `UnityEngine.dll` stub (`fusionhost/UnityEngine/Stubs.cs`, ~500 lines) covering the exact 92
+   types / 418 members Fusion references (list generated by `tools/RefDump` from the DLL
+   metadata): real managed Vector/Quaternion/Matrix/Mathf, `UnsafeUtility` on `NativeMemory`,
+   `JsonUtility` on System.Text.Json (IncludeFields), no-op profiler/scene/physics.
+2. `Photon.Realtime.dll` compiled from the SDK's `PhotonRealtime/Code/*.cs` (Fusion.Runtime
+   references that assembly name; the SDK ships it as source). `Fusion.Log.dll`, managed
+   `NanoSockets.dll` and Linux `libnanosockets.so` copied from the SDK package (address
+   `ToString` P/Invokes it even for relay addresses).
+3. `Host/` spike: Krafs.Publicizer exposes internals; a `NetworkRunner` is constructed
+   (stub `Behaviour` base) only to satisfy `Simulation.Runner` reads (`_config`, `_callbacks`,
+   `_simulation`, `OnGameStartedInvoked=true`); `Simulation.Server(SimulationArgs{Mode=Server,
+   Topology=Shared, Socket=in-memory INetSocket, Callbacks=ours})` and a `Simulation.Client`
+   from the same DLL connected through an in-memory socket pair.
+   **Result so far:** server ticks at 32 Hz, client `Connect` is accepted once
+   `server.RegisterUniqueIdPlayerMapping(actorId, uniqueId, PlayerRef)` was called first
+   (exactly the plugin's Join-time step — `OnConnectionRequest` answers `Waiting` for unknown
+   ids), `PlayerJoined`, both directions carry packets. Remaining spike blocker: the SDK's
+   `StateReplicator.WriteObject_WriteData` writes a `PluginVersion` varint before the word list
+   when `Topology==Shared`, but `ReadObjectUpdate_GetWords` never reads it, so the client parses
+   RuntimeConfig as 0 words + garbage ids ("failed to create an instance"). The real plugin is
+   evidently asymmetric (reads PV from clients, omits it towards clients). `tools/Patcher`
+   (Mono.Cecil) applies exactly that to a server copy (`~/photon-oracle/patched/Fusion.Runtime.dll`):
+   skip the write when `_simulation is Server`, read it when `_simulation is Server`.
+   **With the patch the spike PASSES:** client receives RuntimeConfig + first snapshot, resets to
+   the server tick, `OnClientStart`, `PlayerJoined`, both sims tick in lockstep (server 32 Hz,
+   client ~32 Hz), ~750 B/s each way. Run: `cd ~/photon-oracle/fusionhost/Host && dotnet run -c
+   Release` → `RESULT: OK client connected + ticking` (TRACE=1 for Fusion's own trace log).
+
+**Version note:** Outbound speaks Fusion protocol message version 10 (`V1_6_0`, its
+`ProtocolMessageVersion.LATEST`), the 2.1.2 SDK is 12 (`V1_7_0`) but still lists `V1_6_0`; the
+message codec is versioned per message, the simulation packet layer is not — expect to need the
+matching 2.0.x SDK if the live test shows packet-level disagreement.
+
+### 2026-09-02 (night, cont.): the Fusion Shared-mode server is BUILT into earlier-photon (two-client relay unit-proven; live run is the only gate left)
+
+The spike graduated into the real server. New, all committed-ready in `earlier-photon`
+(uncommitted at session end — see the list at the very bottom):
+
+- **`BlackIce.Server.Fusion.UnityStub`** — hand-written `UnityEngine.dll` (~500 lines) covering the
+  exact 92 types / 418 members Fusion references. Real math/memory/JSON; inert scene/physics/profiler.
+- **`BlackIce.Server.Fusion`** — hosts Fusion's own `Simulation.Server` (Shared topology) one-per-room
+  (`FusionSharedServer`), bridged to clients through `RelaySocket`, an in-process `INetSocket` whose
+  datagrams are Photon **event-101** payloads. `FusionServerFactory` isolates all Fusion-internal use
+  (Krafs.Publicizer). Thread-affine: each room ticks only on its owning listener thread.
+- **`IFusionSessionHost`** (in LoadBalancing) + wiring in **`GameServerHandler`**: on a Fusion Join it
+  assigns the actor a STABLE 8-byte UniqueId (`FusionProtocol.UniqueIdForActor`, written into the Join
+  Confirmation — the client re-presents it on its 101 Connect) and calls `PlayerJoined`; inbound 101 is
+  fed to the hosted server instead of the solo self-echo; 100/101 are never relayed peer-to-peer when a
+  server hosts the room. Leave → `PlayerLeft`.
+- **Host** (`ListenersHostedService`): constructs `FusionSharedServer` with a send callback that emits
+  outbound 101 via `RoomSession.SendToActor(actor, Ev(101, ActorNr=0, Data))`, and drives its `Tick`
+  from the Game listener's new `UdpListener.OnTick` (~32 Hz).
+- **Optional build:** the whole thing links Fusion's non-redistributable DLLs from `server/fusion-libs/`
+  (gitignored: `server/fusion-libs/`, `*.so`). Absent them the server still builds and falls back to the
+  solo path — verified by building the solution with the folder hidden. Produce the libs per
+  `earlier-photon/docs/fusion-shared-server.md`; the one required binary patch (the plugin's
+  PluginVersion read/write **asymmetry** in `StateReplicator`) is applied by `tools/fusion-patcher`
+  (Mono.Cecil) to a server copy of `Fusion.Runtime.dll`.
+
+**What is proven (headless, `~/photon-oracle/fusionhost/Host`):** with the patched runtime, ONE client
+and then TWO clients connect to a single hosted `Simulation.Server`, both reach `HasRuntimeConfig`,
+receive the first snapshot, and tick in lockstep at 32 Hz while state words flow client→server→client.
+That is the two-peer relay the solo-echo hack could never do. `dotnet test` on earlier-photon: 61 + 50
+pass; the single failing `RoleHandlerTests.NameServer_authenticate…` is PRE-EXISTING (fails identically
+on the clean tree, unrelated to any of this — a NameServer test I never touched).
+
+**The only gate left is the live run** — see the rewritten NEXT SESSION below. Everything up to the wire
+is built and unit-proven; what a live Outbound host+joiner will validate is that the client's real 100/101
+bytes drive the hosted server the same way the headless Fusion client does (protocol-version match, the
+GameList/lobby path into `OpJoinGame`, and that the session now holds past the old ~15 s relay-death).
+
+### 2026-09-02 (night, LIVE RESULT): first real two-player session — transport HOLDS ~83s, no relay-death; remaining gap is Shared-mode PlayerRefMapping
+
+Ran host+joiner live through the new Fusion Shared-mode server (earlier-photon rebuilt with
+`server/fusion-libs/` present, restarted). **Milestone reached and it is unambiguous in the server log
+(`earlier-photon.log`, room `53RDYE`):**
+
+- Host `actor=1` 20:26:07, joiner `actor=2` 20:26:44, and the hosted `FusionSharedServer` logged
+  `room "53RDYE" players=2` ticking at 32 Hz with `fed`/`emitted` BOTH climbing (gameplay relayed both
+  directions) — e.g. `tick=2857 players=2 fed=424 emitted=268`. **The two-player session held from
+  20:26:44 to 20:28:07 — ~83 seconds** — with ZERO evict/Timeout/Disconnect from the server. The old
+  ~15 s relay-death is gone. The transport (the thing the whole project was stuck on) works.
+
+- It ended by the **HOST sending a voluntary `OpLeave`** at 20:28:07 (shown to the user as "1020"). Root
+  cause is the KNOWN invite-screen teardown: the host citron log was polling
+  `TryPopFromFriendInvitationStorageChannel` the whole time (host sitting on the Invite-Friends screen),
+  and exiting that screen makes Outbound tear the session down. NOT a server/transport failure.
+
+**Three DEPLOYMENT bugs fixed live to get here (all in the Fusion-host wiring, none in the design):**
+1. `Photon.Realtime` (and Fusion.Common/Log) threw `FileNotFoundException` when the room's
+   `Simulation.Server` constructed — the libs weren't next to the Host exe. Fixed by copying
+   `server/fusion-libs/*.dll` to the Host output.
+2. Copying wasn't enough: `Fusion.Runtime` loads `Photon.Realtime` by NAME at runtime, and .NET only
+   trusts assemblies in the app's `deps.json`. Fixed by referencing every Fusion lib EXPLICITLY in
+   `BlackIce.Server.Host.csproj` (under the FUSION_LIBS condition) so they land in deps.json.
+3. (Earlier) the UnityStub/publicizer/patch chain — already in place from the build work above.
+
+**The remaining gap — the joiner joins + relays but never fully enters the world.** The server sends only
+the two bootstrap messages over event 100 (Join Confirmation `data[38]` + Start `data[25]`). A real Photon
+Cloud Shared session ALSO sends **PlayerRefMapping** (Fusion protocol msg id 8: `ActorId:int`,
+`PlayerRef:int`, `UniqueId:byte[8]`) so each client registers the OTHER player, and re-broadcasts it as
+players come/go. Without it the two peers are in one room relaying state but neither spawns the other into
+the game — exactly "connected but not fully in." Likely also need **ChangeMasterClient** (msg 9) though
+the room's `MasterClientId` prop is already set to actor 1. Next session: encode msg 8 (and 9) with the
+existing `FusionBitWriter`, and have `GameServerHandler` emit PlayerRefMapping to BOTH actors when the
+second one joins (server sender actor 0, event 100) — mirror what `FusionProtocol.EncodeJoinConfirmation`
+does. The UniqueId to advertise is `FusionProtocol.UniqueIdForActor(actor)` (already deterministic). Then
+re-run host+join; success = joiner renders into the shared world and both see each other. Keep the host OFF
+the native Invite-Friends screen (use `scripts/send-test-invite.sh` and accept the toast) so its own
+invite-exit teardown doesn't end the session.
+
+### 2026-09-02 (night, LIVE #2): PlayerRefMapping implemented + confirmed on the wire; two-player session holds but NEITHER client enters gameplay (only keepalives) — the wall is now game-entry, not transport
+
+Built `FusionProtocol.EncodePlayerRefMapping` (Fusion protocol msg id 8) and wired
+`GameServerHandler` to broadcast it both ways when a peer's Start is sent (joiner learns every actor,
+each started peer learns the joiner; addressed with each recipient's own protocol version; PlayerRef ==
+actor, UniqueId == `UniqueIdForActor`). Confirmed live in room `8FTV7E`: after `actor=2`, the server
+sent `byte[35]:08 …` = PlayerRefMapping to both peers, alongside Join Confirmation (01) and Start (05).
+Session held `players=2` cleanly for ~78 s.
+
+**But the joiner never left its loading screen, then TIMED OUT** (Fusion's 120 s StartGameOperation
+limit), and the host dropped. The decisive evidence is the full-session 101 traffic profile:
+- host `54780`: 972× 14-byte, 5× 152-byte (relay Connect), 1× 136-byte.
+- joiner `50552`: 659× 14-byte, 5× 152-byte, 1× 136-byte.
+
+i.e. **~1600 NotifyAcks keepalives and the relay handshake, and ZERO NetworkObject state either way.**
+Neither client authored a single gameplay word the whole time. So the clients complete Join → Start →
+relay Connect → PlayerRefMapping and then just idle-keepalive; the game simulation never starts, so the
+joiner's StartGame never resolves and times out.
+
+**What this rules in/out:**
+- Transport (event 101 / hosted `Simulation.Server`), room join to `actor=2`, and player registration all
+  WORK and hold two peers — repeatably (rooms 53RDYE ~83 s, 8FTV7E ~78 s), no relay-death, no server evict.
+- The wall is now CLIENT-SIDE GAME ENTRY: something after PlayerRefMapping that makes the real client
+  transition from "connected, keepalive-only" into an authoring, ticking simulation (and load the level).
+  The headless spike could not surface this because it drove `Simulation.Client.Update` directly and never
+  ran the real client's CloudServices `StartGameOperation` / scene / spawn path.
+
+**Next step — capture a REAL working session, do not keep guessing.** We own ONE Steam copy of Outbound
+(`/mnt/games/SteamLibrary/steamapps/common/Outbound`). Constraints confirmed with the owner: Steam allows
+only one active game session per account, so the SAME copy/account cannot run on two PCs at once, and
+Family Sharing can't play one copy twice either — a two-Steam-client capture is NOT available.
+`~/Downloads/outbound-real-photon.pcap` is EMPTY (24-byte header only), so there is no prior capture.
+**You very likely do not need two players for this:** the joiner fails to enter its OWN game world
+(keepalive-only, never authors state), which is the SOLO StartGame -> scene-load -> spawn path. So capture
+a SINGLE Steam client connecting to real Photon Cloud and starting/entering a session, and record the FULL
+event-100/101 sequence — specifically what flips a client from keepalive-idle into authoring state. (A
+genuine two-player capture, if ever wanted, would need Steam + a real Switch, or a second Steam account
+with its own copy, both against Photon Cloud.) Capture method: MITM/observe Outbound's Photon UDP (the
+game resolves ns.photonengine.io; point it at a logging relay, or run the game under the same
+citron/Ryujinx PHOTON logging but against REAL cloud instead of our server). Prime candidates for the missing trigger: **Snapshot (msg 6)**, **ChangeMasterClient
+(msg 9)**, a **scene/NetworkSceneInfo** sync, or a room-property change the client waits on. Then
+implement that one thing server-side (same observe-then-implement loop as the rest of the project). The
+capture is the input we lack; everything up to it is now built and proven.
+
+### 2026-09-02 (night, CAPTURE): a real Photon-Cloud session captured + decoded — events are PLAINTEXT, our bootstrap matches byte-for-byte, and the wall is the NotifyData STATE STREAM / client never authoring
+
+Captured a genuine SOLO Outbound×Photon-Cloud session on the Steam client (`pkexec tcpdump` on the
+Photon UDP ports; only one Steam copy, but SOLO is enough — a solo cloud client fully enters the game).
+Decoded it with a new tool `~/photon-oracle/pcapdecode` (references `BlackIce.Photon`: parses SLL2 ->
+IP/UDP -> Photon datagram -> `NCommand` -> `WireMessage`). Artifacts on the pool (never committed):
+`/mnt/media/research/outbound/REFERENCE-cloud-solo-223853.pcap` and `...-decoded.txt`.
+
+**Findings that reframe the remaining work:**
+1. **Events are PLAINTEXT.** Cloud encrypts only auth (NameServer/Master, and the GameServer OpJoinGame
+   response + EvJoin come as `ENCRYPTED msgType=3/4`), but every Fusion 100/101 event is readable. So NO
+   Frida/managed hook is needed — `tcpdump` + our decoder is the capture pipeline going forward.
+2. **Our server's bootstrap is byte-identical to Cloud.** A whole solo cloud session's event-100 is just
+   **Join Confirmation (msgid=1, 38B)** + **Start (msgid=5, 25B)** — NOTHING else (no PlayerRefMapping /
+   Snapshot / ChangeMasterClient for solo). Over 101: one **Accepted (msgid=1, 32B)**. Our server emits
+   exactly 38 / 25 / 32-byte messages for these. The handshake is correct.
+3. **The difference is the state stream.** Immediately after Accepted, Cloud streams **event-101
+   NotifyData (msgid=3 == NetPacketType 3)** continuously: an initial burst (128 / 183 / 184 / 66 B = the
+   world/scene snapshot) then steady 26-27 B ticks at ~30/sec (6419 of them in the session). And the
+   **client authors back**: ~1936 `OpRaiseEvent` carrying 101 data (64-89 B) — it becomes state authority
+   over its player and streams it.
+4. **In our failed sessions the client sent ONLY 14-byte NotifyAcks (type 4) — it never authored a single
+   NotifyData, i.e. it never actually spawned into the game.** Our server DID emit ~1000 substantial 84/99-B
+   101 packets outbound (from the run log), so we are streaming *something*, but the client never crosses
+   into the authoring/spawned state that Cloud's client reaches within ~1 s.
+
+**NEXT — the definitive diff (no more theorizing).** Capture OUR OWN server session with the identical
+pipeline and compare against the cloud reference:
+- Relaunch ONE Outbound host (citron or Ryujinx) against earlier-photon (the built server with the Fusion
+  host). `pkexec tcpdump -i any -s0 -w <pool>/ours.pcap 'udp and (port 5055 or 5056 or 5058 or portrange
+  27000-27003)'` (loopback 127.0.0.1 works on `-i any`). Enter a session.
+- Decode with `~/photon-oracle/pcapdecode <pcap>` and diff the event-100/101 stream against
+  `REFERENCE-cloud-solo-decoded.txt`. Focus: after Accepted, does OUR server send the same initial
+  NotifyData burst (128/184/66 B snapshot) then steady 26-27 B? Do the msgid=3 payloads decode as valid
+  object state on the client? The gap is almost certainly in the initial-snapshot NotifyData content (the
+  scene/RuntimeConfig/spawn words) — our hosted `Simulation.Server` produces different/absent initial state,
+  so the client never spawns and so never authors. Fix that content to match, then re-test.
+- Byte-level reference for the bootstrap is in the decoded.txt; pull raw hex of the first Accepted +
+  first few NotifyData from the pcap with the decoder if a byte diff of payloads is needed.
+
+### 2026-09-02 (night, ROOT CAUSE FOUND): client drops our state because our Fusion SDK (2.1.2) sends NetPacketType V2(250); Outbound's older Fusion only knows NotifyData(3). Fix = build fusion-libs from Fusion 2.0.x.
+
+Two captures + a one-line server change nailed it (decoded with ~/photon-oracle/pcapdecode). Our 101
+stream was ENCRYPTED so the decoder showed "0 events"; the user's hunch that this mattered led to the fix
+that EXPOSED the real bug:
+
+- Made our server send Fusion 100/101 events PLAINTEXT (Cloud sends 100/101 clear even on an encrypted
+  connection): PeerConnection.RaiseEvent skips encryption when ev.Code is 100 or 101. KEEP THIS (correct
+  vs Cloud). It does NOT by itself fix the client (the client decrypted our events fine already), but it
+  let us read our 101 stream.
+- With ours readable: our 101 state packets are msgid=250 = NetPacketType.V2. Cloud's are msgid=3 =
+  NetPacketType.NotifyData. Confirmed from enums:
+  * Outbound build (~/outbound-re/dump-output/dump.cs): Command1, UnreliableData2, NotifyData3, NotifyAcks4,
+    Unconnected5, Mtu6/7, NotifyReliableData8. NO 250.
+  * Fusion 2.1.2 SDK: V2=250, Command1, UnreliableData2, Unconnected5, Mtu6/7, NotifyReliableData8. NO 3/4.
+    Photon replaced NotifyData/NotifyAcks with the unified "V2" packet between Outbound's version and 2.1.2.
+- So our hosted Simulation.Server (2.1.2) streams V2/250; Outbound's client has no handler for 250, DROPS
+  every state packet, never spawns, only sends 14 B NotifyAcks, and times out at Fusion's 120 s StartGame
+  limit. NOT encryption, NOT PlayerRefMapping, NOT the handshake (all correct + byte-match Cloud).
+
+FIX (next session): rebuild server/fusion-libs/ from Fusion 2.0.x (Outbound = ProtocolMessageVersion
+LATEST=10 / V1_6_0; 2.1.2 = 12 / V1_7_0). Outbound's NetPacketType still has NotifyData=3/NotifyAcks=4 ->
+predates V2 -> likely Fusion 2.0.0 GA (verify that release's Fusion.Sockets NetPacketType has NotifyData=3,
+no V2). Steps: download Fusion 2.0.x from Photon (account), redo fusion-libs (DLLs + Linux
+libnanosockets.so, build Photon.Realtime from its PhotonRealtime/Code/*.cs, run tools/fusion-patcher and
+RE-CHECK whether the PluginVersion asymmetry patch is still needed for 2.0.x). UnityStub, RelaySocket,
+GameServerHandler wiring, PlayerRefMapping, and the plaintext-events change are version-independent and
+stay. Then re-capture and confirm our 101 is msgid=3 and the client spawns (it will send its own
+OpRaiseEvent(101) state ~64-89 B like Cloud's client). Reference on pool: pcapdecode,
+REFERENCE-cloud-solo-*.pcap, ours-plain-*.pcap.
+
+### 2026-09-02 (night, FIXED — two players IN GAME for ~2 min): rebuilt fusion-libs from Fusion 2.0.8; the client now spawns and authors. Remaining: session continuity (~2 min drop).
+
+The root-cause fix worked. Rebuilt `server/fusion-libs/` from **Fusion 2.0.8** (Outbound's exact build,
+2.0.8.1402 — downloaded to `~/Downloads/photon-fusion-2.0.8-stable-1402`, staged at `~/photon-oracle/v208`).
+Changes required for 2.0.8 vs 2.1.2 (all done, server builds + runs):
+- 2.0.8 references **Photon3Unity3D.dll** (classic Realtime v4), not PhotonClient/Photon.Realtime. No
+  Photon.Realtime source build needed. Updated `BlackIce.Server.Fusion.csproj` + Host csproj refs.
+- **No PluginVersion patch** for 2.0.8 (that concept is 2.1.x-only) — use Fusion.Runtime.dll UNPATCHED.
+- `Simulation.ICallbacks` differs: rewrote `NoopCallbacks` (adds `OnMessage`->SimulationMessageResult,
+  `OnReliableData(PlayerRef,ReliableId,bool,byte[])`, `ObjectChanged`, `RemoteObjectCreated`,
+  `RemoteObjectDestroyed`; drops OnRemoteCreate/OnObjectWrite/etc.).
+- `TickRate.SharedDefault`->`TickRate.Default`; `Log.InitializeForConsole(LogLevel)`-> best-effort
+  `Log.InitForConsole(LogType.Info)`.
+- UnityStub: added `UnsafeUtility.IsUnmanaged`, `Color32<->Color`, `UnityEngine.Profiling.Profiler`
+  (BeginSample/EndSample), `Quaternion.normalized` (2.0.8 needs these; 2.1.2 didn't).
+
+**Live result (room 9BX5CE, capture pipeline confirmed the pattern):**
+- Our server now streams event-101 NotifyData at **26/27/28 B** (matching Cloud's 26-27 B deltas) with a
+  larger initial burst — was uniform 84 B V2/250 on 2.1.2.
+- **Both clients now AUTHOR state back** — 22/34/46/51/60 B packets (not the old 14 B acks-only). i.e.
+  they SPAWNED and entered the world. User confirmed: "I managed to get in."
+- Session held **players=2 for ~2 minutes** (host 22:07:39, joiner 22:08:21, both streaming until
+  ~22:10:10, ~5900 inbound packets). Then both clients went quiet and the joiner timed out client-side.
+  Our server kept ticking + did NOT evict (600 s grace) — the CLIENTS stopped, not the server.
+
+**NEXT: session continuity (why both clients go quiet ~2 min in).** Entry is solved; this is a smaller,
+different problem. Likely causes to check: (a) our headless `Simulation.Server` runs its OWN clock/tick
+and authors RuntimeConfig/internal state — over ~2 min its time-sync or tick may drift from the real
+clients (Fusion is tick-locked); (b) a relay-continuity break (a peer stops seeing the other's state and
+its per-peer timeout fires); (c) something periodic (Fusion DummyTrafficSync/keepalive, or a game event).
+Diagnose by capturing the ~2 min window (same pcap pipeline) and watching what changes right before both
+go silent — does our server stop sending 26 B NotifyData, do the clients stop acking, does a Disconnect
+(NetCommands.Disconnect / event-100 msg4) appear, or does time-sync (event 100 or the tick numbers)
+diverge. The whole rig is unchanged; just re-run host+join and read the last ~10 s before the drop.
+
 ## NEXT SESSION — concrete plan (Fusion gameplay transport)
 
-**Goal:** a session that actually holds past ~120 s with two players, i.e. fix
-the transport, not the join (the join handshake already reaches actor=2). Do NOT
-declare progress on the strength of `actor=2` in the server log — that is the
-handshake, not gameplay. The success criterion is: both peers stay in the room
-and keep exchanging 101 traffic well past 120 s, with the joiner NOT frozen.
+**Goal:** a session that holds and plays past ~15 s with two players, now that a real Fusion
+Shared-mode SERVER hosts the room (built this session — see the section just above). The success
+criterion is unchanged: both peers stay in the room exchanging gameplay well past the point the old
+solo-echo relay died, joiner not frozen. Do NOT declare success on `actor=2` alone.
+
+### FIRST: produce the Fusion libs and build with them
+The Fusion host is an OPTIONAL build; a fresh checkout has no `server/fusion-libs/`. Reproduce it per
+`earlier-photon/docs/fusion-shared-server.md` (copy the 2.1.x Fusion DLLs + Linux `libnanosockets.so`,
+build `Photon.Realtime.dll` from the package sources, patch `Fusion.Runtime.dll` with
+`tools/fusion-patcher`). The libs used this session are staged at `~/photon-oracle/` and
+`~/REPOS/earlier-photon/server/fusion-libs/` (gitignored) — reuse them. Confirm `dotnet build` reports
+the Fusion project built (not skipped), then restart earlier-photon.
+
+### THEN: live host + join, and read what the hosted server does
+Same rig as always (§0 below). Host a session on citron/Ryujinx, `scripts/send-test-invite.sh <CODE>`,
+accept on the citron joiner. Watch, in order:
+1. **Both peers reach the GameServer and the hosted sim gets them.** photon log: `EnterRoom actor=1`
+   then `actor=2`; and the new Fusion host should now be receiving 101 packets (add a temporary
+   `Log` in `FusionSharedServer.FeedRelay`/`RoomSim.Tick` if needed — it currently logs only Fusion's
+   own Warn stream; raise `FusionServerFactory.EnsureLogInitialized` to `LogLevel.Debug` +
+   `TraceChannels.Network` for bring-up).
+2. **Protocol-version match.** Outbound speaks Fusion message version 10 (`V1_6_0`); the 2.1.2 SDK is
+   built as 12 but still supports 10 per-message. The SIMULATION packet layer (NotifyData/word lists) is
+   NOT per-message-versioned. If the live client desyncs at the object layer (client logs "failed to
+   create instance" or drops right after Start despite the PluginVersion patch), the SDK minor is wrong:
+   get the matching **Fusion 2.0.x** package and rebuild `server/fusion-libs/` from it (the patch +
+   UnityStub are version-independent; only the DLLs change).
+3. **Session holds.** The old death was the host sending `NetCommands.Disconnect(Timeout)` ~15 s after
+   the relay went unanswered. With a real server answering NotifyData, that timeout should not fire.
+
+### If the object layer disagrees (fallback plan)
+The headless proof used two SDK clients, which frame identically to the server. The live Outbound client
+is the same Fusion build as the game, so the risk is only the SDK-minor mismatch above. If rebuilding
+from 2.0.x still disagrees, capture one live 101 NotifyData packet from the host and compare its word
+layout to what the hosted server expects (both are `StateReplicator` — diff the two `Fusion.Runtime`
+versions' `ReadObjectUpdate_GetWords`/`WriteObject_WriteData`). This is the same observe-then-adjust loop
+used all project, now with a real server on our side instead of a hand-rolled relay.
 
 ### 0. Environment (unchanged, all working)
 - Services: `scripts/start-services.sh` (legacy-local account container :8099,
@@ -2817,11 +3161,20 @@ frozen (`ss` shows no stuck `UNCONN recvfrom`; joiner log keeps advancing). Only
 then is any "two-player" claim honest.
 
 ### Uncommitted at session end (commit under <user-a>, per-repo, NO AI attribution)
-- `earlier-photon`: GameProperties store+advertise (the validated join fix),
-  the 251-strip, the in-room eviction grace, the dead-timeout env doc.
-- `earlier-citron`: `legacy_guest_call.cpp` injection stuck-stage reset;
-  `bsd.cpp` `F_GETFL` assert relaxed.
-- `earlier-outbound`: HANDOFF, README, research.md, scripts/ (shared-persona
-  wrappers), start-services env fix.
-- `shared-docs`: `scripts/launch-citron*.sh`, citron-isolation/conventions/README
-  (two-persona model); `earlier-photon/docs/protocol/06-fusion-session-join.md`.
+The earlier-session items (GameProperties join fix + eviction/timeout hardening in
+`earlier-photon`, the citron `legacy_guest_call.cpp`/`bsd.cpp` fixes) were COMMITTED last
+session (`earlier-photon` HEAD `6e64f4b`, `earlier-citron` `8c523f162`). New this session,
+uncommitted:
+- `earlier-photon` (the Fusion Shared-mode server — see docs/fusion-shared-server.md):
+  new projects `server/BlackIce.Server.Fusion`, `server/BlackIce.Server.Fusion.UnityStub`;
+  `server/BlackIce.Server.LoadBalancing/IFusionSessionHost.cs`; edits to
+  `GameServerHandler.cs`, `BlackIce.Photon/FusionProtocol.cs` (`UniqueIdForActor` + deterministic
+  Join-Confirmation id), `BlackIce.Server.Core/UdpListener.cs` (`OnTick` hook),
+  `BlackIce.Server.Host/{ListenersHostedService.cs,*.csproj}`, `BlackIce.Server.sln`;
+  `tools/fusion-patcher/`; `docs/fusion-shared-server.md`; `.gitignore` (fusion-libs, *.so).
+  NB `server/fusion-libs/` is gitignored and MUST NOT be committed (copyrighted Fusion DLLs).
+  Suggested commit scope: `feat(fusion): host Fusion Shared-mode server for two-peer relay`.
+  One PRE-EXISTING test fails (`RoleHandlerTests.NameServer_authenticate…`), unrelated.
+- `earlier-outbound`: HANDOFF (this file).
+- Research artifacts live outside the repos at `~/photon-oracle/` (SDK DLLs, decompiled Fusion,
+  the `fusionhost/` bring-up spike incl. the two-client proof) — copyrighted, never committed.
