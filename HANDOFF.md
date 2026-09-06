@@ -3694,6 +3694,47 @@ game's ordinary joiner arrival, not a first-timer path. Whether the card's "Day 
 (`BlackscreenUI.GetIntroTexts` just picks one of two text sets by a static mode flag). Check: the joiner's
 in-world day after the card should read 2.
 
+## Real-hardware path: friends/push server + the invite dead wire (2026-09-06 research)
+
+**The intended flow** is invite-a-friend via the game UI applet -> friend receives on their Switch -> accepts -> joins. Two independent blockers, both confirmed:
+
+**1. The game's invite-consume is a dead wire on EVERY platform.** `NetworkSystemSwitch.CheckForInvite`
+pops the invite, puts the room code in `InviteData.CustomData`, sets `CachedInvite`, publishes via
+Intercom -- and nothing consumes it into a join. It builds the join from `PlatformSessionID` (hardcoded
+empty) and calls `NetworkSystemSwitch.JoinSession` (no-op, no callers). The only correct `NetworkManager.Join`
+(RVA 0x1BF76C0) call sites are `JoinUI.OnJoin` (code-entry screen, unreachable in the shipped console UI --
+`NetworkingUI` only hosts+invites, no join-by-code field) and a debug class. citron injects
+`NetworkManager.Join+StartCoroutine` on accept (`legacy_guest_call.cpp`) to bridge this. On hardware you
+need to reproduce that as a Switch sysmodule or exefs/IPS patch, OR surface `JoinUI` for manual code entry
+(skips the invite). A hand-assembled ARM trampoline already crashed once; the emulator uses CPU-context
+rewriting. **User's call: build the friends/push server first, cross the injection bridge after.**
+
+**2. Delivery on hardware is NPLN Messaging, not the citron HTTP mailbox.** On citron the whole invite
+transport is HLE'd to plain HTTP: `SendFriendInvitation` -> POST `/api/invitations` (account mailbox),
+a background poller -> AM storage channel. A real console does neither. Mapped from kinnay's docs
+(see memory [[npln-invite-delivery-protocol]]):
+- The invite is an **NPLN Messaging message**, not a friends RPC. `nn.npln.messaging.v1.Messaging`:
+  `SendMessage`(message_type + `fields` MapValue -> receiver_users), `RecvMessage` (server-STREAM the
+  receiver holds open; server pushes), `SendAck`. Keep-alives: immediate on connect (idle_timeout 95s),
+  then every 45s. The Friends service has NO invite RPC (only Activate/List/Subscribe presence).
+- Transport = gRPC/HTTP2 = what the legacy NPLN server (splatoon-3 build, `legacy-local` `npln`
+  service on :18500, serves `*.lp1.t.npln.srv.nintendo.net`) already speaks. Messaging is 3 methods to add,
+  bridged to `openpak-account/invitations.go`'s existing mailbox.
+- **NPNS is only for game-CLOSED** (home-menu notification / launch-from-invite). NPNS = XMPP/ejabberd,
+  replaced by **Penne** (HTTP/2 + JSON) in system 18.0.0. Deferrable; not on the path while the game runs
+  and holds `RecvMessage` open.
+- Sources: github.com/kinnay/NPLN-Protocols (exact protos); github.com/kinnay/NintendoClients/wiki
+  (Messaging-Service, NPLN-Servers, NPNS-Servers, Penne-Servers, BAAS-Server); switchbrew.org/wiki/
+  {NPNS_services,Friend_services}. the third-party setup (`~/REPOS/console patches`) already redirects the Nintendo hosts +
+  installs CA trust; its config surface is `source/legacy_config.h` (server IP) + `legacy_hosts.h`.
+  For hardware Photon: add a DNS.mitm hosts entry `ns.photonengine.io -> LAN IP` (citron uses the
+  `OPENPAK_PHOTON_IP` env for the same rewrite).
+
+**Server-side scope, best-first:** (1) add Messaging (RecvMessage stream + SendMessage + SendAck) to the
+NPLN server, bridged to the invitation mailbox; (2) read the game's `nn::friends` binding once to pin the
+session-invite `message_type` + field keys (payload bytes = what citron already relays); (3) friends+presence
+partly exist -- ensure the joiner shows invitable; (4) defer NPNS/Penne. Then cross the injection bridge (#1).
+
 ## NEXT SESSION — concrete plan
 
 Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
