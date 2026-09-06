@@ -1,6 +1,14 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-09-06 (night). **FRESH JOIN AND RETURNING JOIN BOTH WORK, REPEATABLY** (rooms
+Last updated: 2026-09-06 (late night). **SERVER MEMORY LEAK FIXED** (earlier-photon `1311ba5`): the
+`UdpListener` loop cancelled its `ReceiveAsync` every tick (16 ms with a hosted sim) and on Linux a
+cancelled receive stays queued in `SocketAsyncContext` until data arrives -- a `dotnet-dump`
+`dumpheap -stat` of the 2.8 GB process showed 6.3 M `BufferMemoryReceiveOperation` + linked CTS
+objects. The loop now keeps ONE receive and ONE timer task pending across iterations. **Verify next
+run: `ps -o rss= -p $(pgrep -f bin/Debug/net8.0/BlackIce.Server.Host)` should stay ~0.3-0.5 GB.**
+Housekeeping item 5 also done (delay experiment removed; actors leave `Room.ActorNumbers`, so the
+join-response actor list / master hint are truthful for the host-quits and 3-player tests).
+Earlier that night: **FRESH JOIN AND RETURNING JOIN BOTH WORK, REPEATABLY** (rooms
 4YXD7E fresh, UKTY4E returning: joiner's character loaded, spawned beside the host in the campervan,
 no create-a-character prompt). The evening's "works sometimes" was a fourth server-side gap: in
 Shared topology CLIENTS also send their copies of the PlayerData structs back, and the SDK server
@@ -3753,8 +3761,10 @@ Candidates, in order of value:
 3. **Three players.** `RoomSim` is built for up to 8; only two have ever been in a room.
 4. **Vehicles and building** (`NetworkVehicleDriverSync`, `NetworkFoundationSync`, …): the RPC
    forwarder is generic, but interest/authority on those objects is untested.
-5. Housekeeping: remove the `FUSION_SETPLAYEROBJECT_DELAY_TICKS` experiment; `RoomRegistry`'s
-   `ActorNumbers` never shrinks on leave (`occupants=[1,2,3]` after actor 2 left) — harmless today
-   because master election happens in `RoomSim`, but wrong.
+5. ~~Housekeeping~~ done in `1311ba5` (delay experiment removed; `Room.RemoveActor` on leave).
+6. Memory-leak verification: during item 1, sample the server's RSS every few minutes; the fix is
+   `earlier-photon` `1311ba5` (`UdpListener.RunAsync`). Diagnostics if it still grows:
+   `~/.dotnet/tools/dotnet-dump collect -p <pid> -o /mnt/media/research/outbound/services/x.dmp`
+   then `dotnet-dump analyze x.dmp -c "dumpheap -stat" -c exit` (never dump to /tmp: tmpfs).
 
-Uncommitted at session end: nothing. earlier-photon HEAD `56c8c68`; this file.
+Uncommitted at session end: nothing. earlier-photon HEAD `1311ba5`; this file.
