@@ -26,11 +26,15 @@ Superseded research below; the live state is in [`HANDOFF.md`](HANDOFF.md).
 In short: Photon Cloud's built-in `NintendoSwitch` auth provider can never
 accept a replacement token, so the project runs Outbound against the
 self-hosted [`earlier-photon`](../earlier-photon) server (citron redirect
-`OPENPAK_PHOTON_IP`) plus the `legacy-local` account stack. Hosting a room,
-friend invitations and the joiner's injected join all work up to the session
-lobby; the remaining blocker is Fusion's client not sending `OpJoinGame`.
+`OPENPAK_PHOTON_IP`) plus the `legacy-local` account stack. That server
+hosts Fusion's own Shared-mode `Simulation.Server` per room (headless, from
+the game's exact Fusion 2.0.8 build). As of 2026-09-06 two citron players
+share one world: fresh and returning joins both work, objects, RPCs and room
+properties are relayed, and both players see each other (see the dated sections
+at the end of `HANDOFF.md`; `restart-photon.sh` restarts the server reliably).
 Testing scripts live in `scripts/` (start with `start-services.sh`, then the
-two `launch-citron-*.sh` wrappers). We must not commit tokens, keys, account
+two `launch-citron-*.sh` wrappers; `auto-invite.sh` sends the joiner an invite
+for every room the host opens). We must not commit tokens, keys, account
 data, copyrighted game material or production infrastructure.
 
 ## Initial workflow

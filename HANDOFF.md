@@ -1,6 +1,24 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-09-06. **CONTINUITY IS FIXED — a two-player session now HOLDS INDEFINITELY
+Last updated: 2026-09-06 (night). **FRESH JOIN AND RETURNING JOIN BOTH WORK, REPEATABLY** (rooms
+4YXD7E fresh, UKTY4E returning: joiner's character loaded, spawned beside the host in the campervan,
+no create-a-character prompt). The evening's "works sometimes" was a fourth server-side gap: in
+Shared topology CLIENTS also send their copies of the PlayerData structs back, and the SDK server
+copies them over its own — a stale copy wiped the player→avatar link (`Object=None`) so the host
+dropped itself from its player list and never processed joins. Fixed by re-asserting the link every
+tick (`FusionServerFactory.OnBeforeTick`). With that, the sticky `knownPlayers` rule (a joining client
+keeps NO local character save — FS-traced — and decides new-vs-returning from the room snapshot)
+turned out to be right and is back in. See the last 2026-09-06 section at the end. Earlier that evening: **BOTH PLAYERS SEE EACH OTHER on a FRESH join** (room TY546E,
+user: "now both see each other!"). Two server-side gaps closed today, no DLL/game patch (user rule:
+never patch the SDK assemblies or the game): (1) the SDK server swallows every Fusion INTERNAL
+simulation message (`SetPlayerObject` etc.), so the joiner's avatar never linked to its PlayerData and
+the host never ran its join sync — fixed via an `OnBeforeTick` flag swap that routes them through
+`OnMessage`; (2) our eNet transport had no case for Photon command type 15 (reliable-unsequenced
+fragment, used for every relay packet above the MTU) and acked it with type 1 instead of 16, so the
+host's ~100-RPC world-sync burst was dropped, retransmitted, and the host died with **1014**
+(= 1000 + Fusion `ShutdownReason.PhotonCloudTimeout`). See the last 2026-09-06 section at the end.
+Still to verify on screen: pickups both ways (state-authority requests — none observed yet) and
+pre-join world state on the joiner. **(Earlier status, now historical:)** CONTINUITY IS FIXED — a two-player session now HOLDS INDEFINITELY
 (7+ min, no drop), but the two clients are in SEPARATE WORLDS: no game state replicates.** The
 ~2-min drop was our own bug: `RoomSim.Tick` gated on the joining thread id, but the listener loop
 is async and hops pool threads, so the hosted sim froze whenever the pool parked that thread (20 s
@@ -3175,6 +3193,440 @@ child process group on a low-memory event, which took the server down mid-sessio
 connection's send schedule each tick) was written and REVERTED — it can't matter until objects parse
 (nothing to schedule), so it wasn't committed. Re-add it only if path (1) makes objects parse and
 they still don't forward.
+
+### 2026-09-06 (cont.): "separate worlds" ROOT-CAUSED — a NullReferenceException in the hosted server, NOT a missing serializer table; fixed, live re-run pending
+
+The 09-06 "root cause (high confidence)" above is WRONG and is retracted. Read straight from the
+Fusion 2.0.8 decompile (`~/photon-oracle/decompiled-208/Fusion.Runtime.cs`):
+- `NetworkProjectConfigAsset.SerializableSimulationBehaviourMeta` is just `{Type, ExecutionOrder}`
+  (execution-order overrides), not a serializer table.
+- `NetworkObjectMeta.Serializers` is a STATIC table (`GetSerializers(HasMainTRSP)`): only the
+  built-in NetworkTRSP compression at words 22–28, keyed by a header flag. The generic server needs
+  NO game registration to parse client objects. The word layout was never the problem.
+
+**The real failure was in the archived log all along** (`services/earlier-photon-0906-nre-noneconn.log`,
+line ~300–370). Every client packet carrying object updates — the 3-fragment ~3.3 KB spawn burst, then
+the 342 B and 80 B follow-ups — printed:
+```
+Object reference not set to an instance of an object.
+   at Fusion.Simulation.StateReplicator.ReadObjectUpdates()
+   at Fusion.Simulation.StateReplicator.RecvPacket()
+   at Fusion.Simulation.Server.RecvPacket()
+```
+BEFORE the single "Object does not exist … marked as confirmed" warning. The transport acks those
+packets anyway (NotifyAcks are below the parser), so the client flips its objects to
+CreatedConfirmed and stops sending headers; "does not exist" is the downstream symptom.
+
+**Why it NREs:** `ReadObjectUpdates`' Shared-topology branch does
+`GetSimulationConnectionForPlayer(_simulation.LocalPlayer).GetObjectData(id, create: true)` for
+every object update. On a pure `Simulation.Server`, `LocalPlayer` is `PlayerRef.None`, and the only
+`PlayerAdd` paths register real players (`RegisterUniqueIdPlayerMapping`) or the Host's local player —
+nothing ever puts `None` into `_playersConnections`, so the lookup is null. Fusion.Runtime has
+`InternalsVisibleTo("Fusion.Plugin")`: Photon's closed cloud plugin evidently registers that
+connection itself; the SDK alone never does. The headless two-client spike never spawned an object,
+so it never hit this line.
+
+**Fix (earlier-photon `FusionServerFactory.CreateServer`, uncommitted):**
+1. `sim._playersConnections[PlayerRef.None] = new SimulationConnection(sim);` (None == default, so the
+   ctor's `Player` is already right). The synthetic connection has a null `NetConnection*`; the
+   only readers of that map are `TryGetValue` sites that either short-circuit on `LocalPlayer`
+   (`GetPlayerRtt`) or key on real players/message targets, and `Player2Connection` has no callers.
+2. `NoopCallbacks.RemoteObjectCreated` now calls `sim.Replicator.OnObjectSpawnedLocal(id)` for
+   non-struct, non-reserved objects. That is what `NetworkRunner` does after spawning a remote-created
+   object; on the server it does `foreach connection: GetObjectData(id, create: true)`, which puts
+   the object on every OTHER client's send schedule (`SchedulingEnabled` is the default). Without it a
+   client-spawned object would parse but only ever be scheduled to players that join LATER
+   (`_invokeJoinedLeaveQueue` sweeps existing objects for a new player) — never to the peer already
+   in the room. This is the real version of the reverted "ScheduleAllObjects" idea, at the right hook.
+
+Built (`dotnet build` Host, 0 errors), server restarted detached at 09:18 UTC (log clock) with the
+previous log archived. **Live re-run pending:** host + `send-test-invite.sh` + accept. Expect: no NRE
+in the log; server→client 101 grows past the 26/27 B header-only floor once the second player
+spawns; host's player list shows the joiner; both see each other. If the joiner's objects parse but
+still don't reach the host, read `WriteLevelUsingScheduling` (`ScanAndWriteObject`) for the sender
+connection — the server currently also echoes an object back to its own author, which the client
+ignores when it is state authority (`IsSimulated`), so that is not expected to matter.
+
+Memory leak from the 09-06 note is untouched (server was at 1.3 GB after the morning's runs; restart
+between long runs still applies).
+
+### 2026-09-06 (cont. 2): LIVE — first genuinely shared world; four server-side gaps closed in one sitting
+
+Five host+join rounds this morning (rooms E4A9PE, SLQG9E, TKFJGE, 4BJSXE, DCTKKE), each one
+exposing the next wall in the hosted `Simulation.Server`. All fixes are in earlier-photon
+`server/BlackIce.Server.Fusion/` (uncommitted at time of writing), in order:
+
+1. **NRE in `ReadObjectUpdates`** (section above) — synthetic `SimulationConnection` for
+   `PlayerRef.None` + `RemoteObjectCreated → Replicator.OnObjectSpawnedLocal`.
+2. **`AllocateObject` assert `37072 <= 32768`** (room E4A9PE): Outbound's avatar object
+   (`Prefab 7`) is **9268 words = 37 KB**; the SDK default heap block is 32 KB.
+   `cfg.Heap.PageShift = PageSizes._128Kb`. (Outbound's real `HeapConfiguration` was never located —
+   `dump.cs` has only field names.)
+3. **No master client** (room TKFJGE dump: `rc.master=None rc.host=None`): nothing in the SDK writes
+   `SimulationRuntimeConfig.MasterClient` on a server (the cloud plugin does). `RoomSim.ElectMaster`
+   writes the lowest actor into the RuntimeConfig struct on join/leave; it replicates via
+   `WriteStructs`. User-visible: host now lists itself as a player.
+4. **RPCs were dropped** (room 4BJSXE): the joiner spawned ONLY its 675-word `Prefab 11` object,
+   never the avatar — it was waiting on the host's join handshake, which Outbound does over Fusion
+   RPCs. RPCs are `SimulationMessage`s; `Simulation.ReadMessages` hands every client RPC to
+   `ICallbacks.OnMessage` and NOTHING else forwards it — `NoopCallbacks` returned `Ignored`.
+   `OnMessage` now relays exactly like `NetworkRunner.OnMessage` does on a Host: targeted →
+   `Sim.ForwardMessage(m, m->Target, required: true)`, otherwise to every `_connections` player
+   except `m->Source`. Client-side authority masks filter over-forwarding. Client-to-client reliable
+   data was already proxied inside `Simulation` (`ReliableDataTransferModes` default includes
+   `ClientToClientWithServerProxy`) — no callback needed.
+
+Room DCTKKE (10:38): 178 RPCs relayed in the first ~90 s, both directions, zero Fusion errors,
+`players=2` steady. User: "now we are cooking!" Also reported and NOT yet re-verified after fix 4:
+items the host had already picked up were still available to the joiner (fits dropped RPCs and/or
+unset master client — check again).
+
+**Diagnostics kept in the tree (cheap, useful):** `[FusionHost] remote object …` on every client
+spawn (id/prefab/words/SA/flags), `[FusionHost] rpc from … fwd=N` per relayed RPC (NB `target=`
+prints None after a targeted forward because Fusion clears `Target` on send), and
+`[FusionHost] objects: …` every 5 s = `FusionServerFactory.Dump` (RuntimeConfig master/host,
+per-object SA/ChangedTick, per-connection Status/TickSent/TickAcknowledged). Read the dump first
+next time something "isn't showing".
+
+**Operational lessons today:**
+- Kill the server by PID, never `pkill -f BlackIce.Server.Host` from a Bash tool call (the pattern
+  matches the calling shell — took the tool call down with it once).
+- A citron that outlives its server WILL crash with "Uncaught C++ exception" on the next manufactured
+  Join (`legacy_guest_call` fires into a runner with stale state). Relaunch both citrons after
+  every server restart. `launch-citron.sh` refuses to start while the old process is still exiting
+  (its cwd readlink fails → "foreign citron"); wait a few seconds and retry.
+- Invites: `scripts/auto-invite.sh` (new) replaces the per-round one-shot watcher. It tails the
+  server log, sends `send-test-invite.sh <code>` once per new host room, and resets itself when the
+  log file is replaced by a server restart. Start it detached
+  (`setsid nohup scripts/auto-invite.sh >/dev/null 2>&1 </dev/null &`); its log is
+  `services/auto-invite.log`. A one-shot watcher silently does nothing on the user's second host —
+  that was mistaken for "the invitation system stopped firing".
+
+### 2026-09-06 (cont. 3): a REGRESSION and its revert — object ids decoded, RPCs decoded, and a rule about live testing
+
+**Correction to "Still open" above:** `Prefab 7` (9268 words, `DestroyWhenStateAuthorityLeaves`, no
+TRSP, host-only) is NOT the avatar — it is the master-client world-state object (the joiner sends all
+its join-time RPCs *to it*). The avatar is **`Prefab 11`** (675 words, `HasMainNetworkTRSP`,
+`AllowStateAuthorityOverride`; `NetworkPlayer` is weaved with 109 words + nested behaviours) — and the
+joiner DOES spawn it (`[Id:1049600]` every room). So "joiner spawned only one object" was the joiner
+being fully in. Acting on that misreading caused the regression below.
+
+**The regression (rooms 74EKSE → KMK3EE):** I added, without asking what was on screen,
+(a) `SceneInfo`/`PhysicsInfo` `StateAuthority = PlayerRef.MasterClient` and (b) master-client election
+every tick (so the host is master from tick 1 instead of at the joiner's arrival). Result: the
+**host stopped sending its join sync** — the 134 targeted RPCs host→joiner that every working room
+had — and the joiner vanished from the host ("we had it working and you changed something").
+**Both reverted**; the server is back to the DCTKKE behaviour (`ElectMaster` on join, which for a
+solo host lands when the 2nd actor joins because `RuntimeConfig` only exists after the first Update).
+The server's SceneInfo stays at StateAuthority None (client SceneInfo updates are skipped by
+`ReadObjectUpdates`; Outbound drives scenes through Photon room properties — `OpSetProperties
+{"scene"="startingLevel","vehicleType","knownPlayers","version"}`, re-broadcast by the host ~1.6 s
+after each join as `EvPropertiesChanged`, which the joiner receives). Rule recorded in memory: **one
+behaviour change per live round, and ask what both screens show before making it.** Diagnostics-only
+builds may be deployed freely.
+
+**RPCs are now decoded in the server log.** `[FusionHost] rpc from P target=T flags=F obj=ID beh=B
+method=M size=N fwd=K` (`RpcHeader` = target object, behaviour index within the prefab, weaved
+method index). Map `beh/method` with `/mnt/media/research/outbound/rpc-invokers.txt`
+(171 rows: `Class index,sources,targets Name`, extracted from `dump.cs`'s
+`[NetworkRpcWeavedInvoker(index, sources, targets)]` attributes; `sources/targets`: 1 = StateAuthority,
+7 = All). Behaviour index → class needs the prefab's component order, which the dump lacks, so
+match on `(method index, sources, targets)` + plausibility. Join handshake seen in every room:
+joiner → host's world object `525314`: 10× `beh=47 m=1`, then `beh=9/11/20/48/61`; host replies
+`beh=61 m=2` then (working rooms only) **134 targeted RPCs to the joiner** = the world sync
+(`SendCurrentDownloadsToPlayerRpc`-style, `PlayerJoinedRemoteRpc(joinedPlayer, areaIndices)` etc.).
+Absence of that burst = host never registered the joiner.
+
+**Also learned:** the joiner's `OpLeave` 49 s into 74EKSE was the USER backing out to re-send an
+invite, not a client timeout. Rooms whose citrons are killed keep ticking `players=N` for the full
+`DeadTimeoutSeconds=600` before eviction reaches `PlayerLeft` — three sims were alive at once at one
+point; that, not a code leak, is most of the memory growth. `Dump` now includes the SceneInfo struct.
+
+**State at hand-off:** server = "cooking" build + RPC logging (uncommitted, earlier-photon);
+citrons relaunched fresh; auto-invite running. Awaiting the user's report on the reverted build:
+does the host list the joiner, do they see each other, are pickups in sync. Logs per room:
+`services/earlier-photon-0906-{firstshared-SLQG9E,diag-TKFJGE,master-4BJSXE,rpc-DCTKKE-TP4PWE,
+sceneauth-74EKSE,sceneauth2-KMK3EE}.log`.
+
+### 2026-09-06 (late): ROOT CAUSE of "joiner invisible / asked to create a char" = empty `knownPlayers`; the EnsureAuthorities regression; and the memory-leak non-bug
+
+Long, hard session. Findings that MUST survive:
+
+**The EnsureAuthorities regression (my fault, user was right).** At room KMK3EE I reacted to a
+symptom the user had caused intentionally (they pulled the joiner) by adding, WITHOUT ASKING,
+`FusionServerFactory.EnsureAuthorities` (SceneInfo/PhysicsInfo `StateAuthority = MasterClient` +
+master election every tick, called from `RoomSim.Tick`). It broke the host's join sync. Reverted in
+full; current `FusionServerFactory`/`FusionSharedServer` are back to the DCTKKE-working logic
+(`SetMasterClient`/`ElectMaster` on join only; no per-tick authority). Also STRIPPED the later
+diagnostics that read `m.Shadow.Raw` (the `Shadow` getter lazily CREATES a snapshot and can disturb
+`ScanAndWriteObject`) and the `RpcHeader`/tick logging in `OnMessage`. The server is minimal + clean.
+Lesson saved to memory `ask-what-user-sees-before-changing-behaviour`: never treat "BINGO"/agreement
+as consent to a destructive/state-changing action; ask first; never kill citrons or move saves
+without an explicit yes (I killed the joiner mid-good-run once — do not repeat).
+
+**The memory "leak" is NOT a leak.** InRoom peers get `InRoomDeadTimeoutSeconds=1800` (30 min) of
+silence grace by design (a Switch sleeping / applet on screen must not drop a real session); the
+short `DeadTimeout=600` only applies pre-room. Eviction DOES dispose: `RunMaintenance` →
+`peer.NotifyDisconnect()` → `handler.OnDisconnect` → `LeaveRoom` → `_fusion.PlayerLeft` → RoomSim
+disposed. Killed clients just linger up to 30 min. For faster test cleanup set
+`BLACKICE_Server__Listener__InRoomDeadTimeoutSeconds=60`.
+
+**THE ACTUAL GAMEPLAY ROOT CAUSE — `knownPlayers`.** Confirmed by diffing the ONE working session
+(DCTKKE) against every failing one:
+- DCTKKE host broadcast room GameProperties `knownPlayers="tlzsBVZzZI7q8FucZiXWBO3Vmls=,
+  vRZWGUoFUGRtzkIa1Q84HYIkpFo="` (two hashes) + `scene`/`vehicleType=3`. Joiner was RECOGNISED →
+  loaded its character → visible on host. **DCTKKE was a RETURNING join.**
+- Every failing session: host broadcasts `knownPlayers=""` (empty), joiner join props `vehicleType=0`.
+  Empty list = this world has no record of the joiner → game runs the create-a-character path
+  ("It asked me to create a new char") → the joiner spawns a NEW avatar (Prefab 11, Player:2) but the
+  host never registers it (host→joiner SimulationMessage forwards ~4 vs ~134 in DCTKKE) → invisible.
+- User's spec: join a world you've never been to → create a char; join one you HAVE → load your
+  existing char where you left off. User: "its the server job to know that", "joiner just need to
+  fucking join it". So the fix is server-side (NO game patch — user was emphatic: never patch the
+  game binary, on citron OR Ryujinx).
+
+**`knownPlayers` hash = `base64(SHA1(player-identity))`**, built by
+`NetworkKnownPlayerSync.SyncKnownPlayers` via `NetworkUtils.CalculateHashString` (dump.cs 31447 /
+32348). Exact identity string fed in NOT yet pinned (finish reading `CalculateHashString` +
+`SyncKnownPlayers` b__3 lambdas — candidates: DisplayName / account/NSA id).
+
+**The contradiction to resolve first:** the user joins as a "returning player" but the hosted world's
+`knownPlayers` is EMPTY — so either the host is on a DIFFERENT world than the joiner previously joined,
+or that record was lost. AND: we have NEVER observed a genuine FIRST-TIME join make the joiner visible
+(DCTKKE was a returning join), so the first-time/create-char path may itself be the visibility bug.
+
+**PRECISE reproducible RPC signature of the failure (fresh citrons + clean server, room DTS8AE, RPC
+logging re-added to `OnMessage`, safe read-only `RpcHeader.Read` — NO Shadow):**
+- Joiner (Player:2) → host world object `[Id:525314]` (Prefab 7, master-client object): `beh=47 method=1`
+  sent **10× as a RETRY** (its initialization request), plus one-shot `beh=36/9/61/48/20/11`.
+- Host (Player:1) sends: `beh=71 method=1` ~69× (broadcast, flags=2, a high-freq world sync) and exactly
+  **ONE** targeted RPC to Player:2: `beh=77 method=2` (flags=18). DCTKKE (worked) sent ~134 targeted.
+- So the host RECEIVES the joiner's init request (server forwards it, fwd=1) but NEVER emits the
+  `InitializePlayer*`/world-sync burst back. The joiner retries, times out, stays invisible.
+- Behaviour INDEX (47/71/77) is the slot on the prefab, NOT the RPC method id, and the dump lacks the
+  prefab's component order, so mapping beh→class needs that order. `NetworkSaveSync` RPCs are the
+  suspects (Initialize* = sources 1 StateAuthority / targets 7 All; `RequestInitializationRpc` = idx 8).
+  KEY QUESTION for next time: does the host reject the joiner's request on an authority mask
+  (`IsStateAuthority(meta, joiner)` false because the joiner is not SA of 525314), or does it simply
+  never fire `OnPlayerJoined(player2)` so it has no registered player to init? Decide by instrumenting
+  the host guest (why it doesn't invoke/answer) OR by the real Cloud two-client capture below.
+
+**What is NOT the cause (ruled out this session):** the current server binary (reverted to DCTKKE
+logic, still fails), accumulated citron state (fresh citrons still fail), the diagnostics
+(stripped/​re-added safe-only), ghost rooms / memory (non-bug, see above). The failure is the host's
+game logic not initializing the joiner, and it reproduces on a fully fresh run.
+
+**Biggest missing input remains a genuine two-client Photon CLOUD capture** (only SOLO was ever
+captured — `REFERENCE-cloud-solo-*`). One Steam copy blocks a two-Steam capture; options are Steam +
+a real Switch, or a 2nd Steam account+copy. Without it we are guessing at what the real host emits on
+a join. This is the single highest-value thing to obtain.
+
+**CONSOLIDATED root cause (user-confirmed, both symptoms are ONE bug):** the joiner does NOT receive
+the host's complete world picture on join. Concretely, the user reports resources the host already
+GATHERED (gone from the host's world) are STILL PRESENT for the joiner — the joiner loads the default
+level and only gets LIVE deltas after join (a fire lit post-join DOES show), never the pre-join
+snapshot. Same missing init is why the host never registers/sees the joiner. So: **the host never
+sends the joining player the world-state initialization burst** (~134 targeted RPCs in DCTKKE; 1 now).
+The joiner's `beh=47` ×10 retries is it asking for that snapshot; unanswered → stale world +
+invisible-on-host. NOT two bugs, one.
+
+**EXACT NEXT STEP (was mid-build when we stopped — do this first next session):** the host normally
+pushes that snapshot when it fires `OnPlayerJoined(player2)`, which fires in
+`StateReplicator.ReadObjectUpdates` when it receives a **PlayerData struct** creation for that player
+(`flag3 && meta.Type == NetworkObjectTypeId.PlayerData` → `_invokeJoinedLeaveQueue.Enqueue((player,
+true))`, Fusion.Runtime 2.0.8 decompile line ~39961). Our server CREATES those structs in
+`RegisterPlayer` → `RegisterUniqueIdPlayerMapping` → `GetPlayerSimulationData(create:true)` →
+`AllocateStruct<PlayerSimulationData>(GetNextId(), 0, NetworkObjectTypeId.PlayerData)`. Add a SAFE
+diagnostic (plain reads, NO `Shadow`) to `FusionServerFactory.Dump` that, for each PlayerData struct,
+prints its `PlayerSimulationData` and per-connection delivery:
+  - Enumerate `sim._structs`; for each where `meta.Type == NetworkObjectTypeId.PlayerData`, read
+    `TryGetStructData<PlayerSimulationData>(id, out var d)`. **`PlayerSimulationData` layout (found
+    this session):** `PlayerRef Player` (off 0), `NetworkId Object` (next), `int Actor`. Also
+    `sim._playerDataLookup` maps `PlayerRef → NetworkId`.
+  - Print `Player`, `Object` (does it link the joiner's avatar `[Id:1049600]`?), and for each
+    `sim._connections` whether it has ObjectData for that struct id + Status/TickSent/TickAcknowledged.
+  - **Decision:** if the host's connection HAS the joiner's PlayerData struct with `Object` pointing at
+    the avatar and acked → the struct reached the host, so the bug is the host's own `OnPlayerJoined`
+    NOT firing (host-side / Fusion-version), pursue the Cloud capture or host guest instrumentation.
+    If the host does NOT get that struct (or `Object` is empty/0) → OUR server isn't delivering the
+    joiner's player registration; fix by ensuring the joiner's PlayerData struct (with its avatar link
+    from the joiner's `SetPlayerObjectId`) is created/relayed to the host as a creation. That is the
+    likely server-side fix and where to start.
+
+**Live state at end of session (2026-09-06 ~16:10):** server UP on the clean build + re-added SAFE
+RPC logging (`OnMessage` logs `rpc from … obj/beh/method fwd=N`; the `Shadow`-reading dump and the
+per-tick EnsureAuthorities are OUT). earlier-photon uncommitted (3 files: FusionServerFactory.cs,
+FusionSharedServer.cs, docs). Both citrons fresh (host/joiner), `scripts/auto-invite.sh` running
+(host→joiner, one loop — killed a duplicate). Reproduced the failure on this fully-fresh run (room
+DTS8AE): host sent 1 targeted init RPC, joiner retried `beh=47` ×10, stale world + invisible.
+
+**Server-side fix plan (once the above is resolved):** the server persists, per host world, which
+joiner identities have joined, and injects their hash into the room's `knownPlayers` (RoomRegistry
+already stores/re-serves GameProperties: `RoomRegistry.SetProperties` / `GameProperties`;
+`MasterServerHandler` advertises them; `GameServerHandler.HandleSetProperties`). Reproduce the joiner's
+`base64(SHA1(identity))` server-side and add it so a returning joiner is recognised. Must also confirm
+the returning-LOAD path works end-to-end and that a first-time join can make the joiner visible at all.
+
+**Ryujinx:** hosting works; the missing piece is the join TRIGGER (citron's `legacy_guest_call`
+fires `NetworkManager.Join(code)` on invite pop; Ryujinx has no equivalent). Since no game patching is
+allowed, the Ryujinx path is a managed-C# guest-call: arm on
+`IApplicationFunctions.TryPopFromFriendInvitationStorageChannel`, then rewrite the game thread's CPU
+context at `SyscallHandler.SvcCall` (has `IExecutionContext` GetX/SetX + `GetCurrentThread`) to call
+Join with a sentinel return — the Ryujinx analog of citron's `OnBeforeRun`/`OnFault`. Hard part: PC
+redirect after SVC in the ARMeilleure JIT (via `DebugPc`/interrupt), and capturing
+`NetworkManager.Instance`. Do this only AFTER citron's rejoin works, then port the proven behaviour.
+
+Current live state at handoff: server clean+restarted (photon UP), both citrons up (host on an
+"established" save whose world nonetheless has empty knownPlayers — see contradiction), auto-invite
+loop running (`scripts/auto-invite.sh`, host→joiner). Save backups:
+`/mnt/media/research/outbound/save-backups/` (20260906-130207 = both profiles;
+joiner-poisoned-131854 = a joiner save moved aside then restored).
+
+### 2026-09-06 (evening): FRESH JOIN WORKS — both see each other. Two server-side gaps: swallowed Fusion internal messages, and eNet command type 15
+
+Rule confirmed by the user today: **never patch the Fusion DLLs or the game** — server code only.
+(fusion-libs/Fusion.Runtime.dll is the pristine 2.0.8 binary, md5 identical to the SDK's; the
+`tools/fusion-patcher` PluginVersion patch was a 2.1.2-only thing and is NOT applied to 2.0.8.)
+
+**Gap 1 — the SDK server drops every Fusion INTERNAL simulation message.** `Simulation.OnMessageInternal`
+(Fusion.Runtime 2.0.8 decompile line ~42778) is a log-only stub; `DeliverMessages` routes any message with
+`FLAG_INTERNAL` (64) there and never to `ICallbacks.OnMessage`. The cloud plugin implements them; a pure
+`Simulation.Server` does not. Types (enum `SimulationMessageInternalTypes`): `SharedModeSetAlwaysInterested=3
+{Object, Interested, Player}`, `SharedModeRequestStateAuthority=4 {Object, Acquire}`, `SetPlayerObject=6
+{Object}`, `SetAreaOfInterest=7 {Center, Radius}`. Consequence: the joiner's `SetPlayerObjectId` (sent right
+after it spawns its avatar) never landed in the replicated `PlayerSimulationData {Player, Object, Actor}`
+struct, so the host's `Runner.GetPlayerObject(joiner)` was null and the host never ran its join sync. Fix
+(earlier-photon `FusionServerFactory.NoopCallbacks`): `OnBeforeTick` (invoked immediately before
+`DeliverMessages` each tick) walks every `SimulationConnection.MessagesIn` and rewrites `FLAG_INTERNAL` to a
+private user flag (`FLAG_USER_FLAGS_START`); the SDK then delivers the message via `OnMessage` in normal
+tick/sequence order, where `HandleInternal` applies it: `SetPlayerObject → sim.SetPlayerObjectId(source, obj)`;
+`RequestStateAuthority → meta.StateAuthority = source` if the object has `AllowStateAuthorityOverride` or
+no live authority (release → None; the header word change is re-sent to all clients by the server's scan);
+`SetAlwaysInterested → conn.Add/RemoveAlwaysInterested`; AOI ignored. Confirmed live: `[FusionHost]
+internal SetPlayerObject [Player:N] -> [Id:…]` for both players every round, and the host then recognised
+the joiner (broadcast `knownPlayers` with BOTH hashes ~2 s after the join) and fired its world sync.
+
+**Gap 2 — eNet command type 15 (`CT_EG_SEND_FRAGMENT_UNSEQUENCED`).** With gap 1 closed, the host died
+with **1014** ~17 s after every join, and the joiner saw "host has disconnected" a couple of seconds
+earlier (the host's ~1/s `beh=71` heartbeat RPC stopped). Diagnosed with a per-second queue dump + Fusion's
+`SimulationMessage` trace channel (`Log.InitializeForConsole(new LogSettings(LogLevel.Info,
+TraceChannels.SimulationMessage))`): the server's inbound RPC queue for the host was stuck at
+`expectSeq=17, head seq=22, count=130` — sequences 17–21 never arrived, and the host's Fusion packet
+sequence had holes (F7, FD, 00, 03, 06). Raw eNet trace: those were `Cmd(15) flags=3` pairs (1172 B +
+35 B fragments) — Photon Realtime v4's reliable-UNSEQUENCED fragment (14 = reliable-unsequenced twin of
+6; 16 = its ACK type; 17–19 = ack2 variants), which Fusion uses for every relay packet above the MTU.
+`EnetPeer.HandleCommand` had no case for 15 (payload dropped) and acked it with type 1; the client
+(`PhotonClient.dll` decompile: `RemoveSentReliableCommand(seq, channel, isUnsequenced = ackType==16)`)
+never matched the ack, retransmitted (same seq 1/2 three times in 100 ms), and hit its reliable timeout →
+`DisconnectCause.ClientTimeout` → `ShutdownReason.PhotonCloudTimeout` (=14) → Outbound shows 1000+14.
+(Earlier codes fit the same table: 1001 = Error, 1020 = OperationTimeout.) Fix (`BlackIce.Photon`):
+types 14/15 handled like 6/8 (identical headers, verified from the client decompile), ack type 16 when the
+acked command has `FlagUnsequenced`, fragment reassembly keyed by `(channel, startSeq)` so interleaved
+retransmits don't clobber each other. Test: `SendFragmentUnsequenced_reassembles_interleaved_groups_and_acks_with_type16`.
+Result (room TY546E): host's world sync = 110 targeted `beh=27 m=2` RPCs + others, all forwarded, no
+disconnect, **both players see each other on a first-time join.**
+
+**Also learned today:**
+- Fusion's internal Info logging WAS already active (`adding player` lines) — no exceptions were being
+  swallowed; the trace channel is the useful addition. `[FusionHost] msgq …` (1/s per connection with a
+  non-empty queue) and `[FusionHost] objects: …` (every 5 s, no `Shadow` read) are in the tree.
+- A citron that outlives a server restart does NOT always crash loudly: the joiner's frontend simply froze
+  (log stopped mid-line at the invite pop, no dialog reported). Relaunch the joiner after every server
+  restart; the queued invitations are picked up on its first poll (`PollInvitations: 1 invitation(s)` →
+  `TryPopFromFriendInvitationStorageChannel` → `GUESTCALL firing Join`).
+- `scripts/start-services.sh` skips the photon start if port 27000 is still bound by a dying process —
+  always verify the PID changed and `earlier-photon.log` was recreated after a restart. `kill "$list"`
+  with a space-joined string fails in zsh; pass PIDs as separate args.
+- Third round of the day (KLJMTE) was a different failure: the host never registered the joiner at all
+  (no knownPlayers broadcast, no heartbeat RPC ever) — the host game was in a different state; not
+  reproduced after the transport fix. Watch for it.
+
+**Returning join (later the same evening) — it needs the JOINER's local save; two server experiments
+tried and reverted:**
+- Rooms ESEUNE/PNGTSE/9ULAVE: host re-hosted its saved world (knownPlayers written at host time =
+  `vRZW…` = the joiner's hash, then `""` 1 ms later — that double write is normal, DCTKKE had it too),
+  joiner came back → host answered `beh=77 method=1` (returning) instead of `method=2` (fresh) and sent
+  NO world sync; joiner repeated its `beh=47 m=1` request (byte-identical to a fresh join: a UTF-32
+  string `tool-craf…`) ten times; the user was asked to create a new character. Only NotifyData/Acks on
+  the wire — no reliable-data stream is involved.
+- **Game design, from the decompile** (`decomp/NetworkSaveSync/NetworkSaveSync.c`,
+  `OnOtherPlayerJoined`): the host calls `LoadManager.FindSerializedNetworkPlayer(userId, platform)`;
+  NOT found → sends `InitializePlayer{Storage,Backpacks,Tools,Upgrades,Needs}Rpc` +
+  `InitializeInteractionTasksRpc` + `InitializeToolTasksRpc` + `RequestInitializationRpc` (the ~110-RPC
+  burst); FOUND → sends only `RequestToggleInitializedRpc` and expects the joiner to restore from ITS OWN
+  save. The joiner profile wrote NO save today (its newest are the 5-minute `Multiplayer_*.autosave`
+  files from 09-02 — the ones behind the morning's working returning join DCTKKE); today's joins lasted
+  ~1 min and "log out" saves nothing. So the host treated the joiner as known while the joiner had no
+  character → mismatch. **Procedure for a returning-join test: joiner stays in the world until a new
+  `Multiplayer_*.autosave` appears in its Savegames (watch the dir), then leaves; host saves; re-host.**
+- Experiment 1, REVERTED: delay applying `SetPlayerObject` by 128 ticks (env
+  `FUSION_SETPLAYEROBJECT_DELAY_TICKS`, still in the code, default 0 = off). No effect on the host's
+  reply — Object linking is not what selects the path.
+- Experiment 2 (room 9ULAVE): server keeps a non-empty `knownPlayers` over the host's empty overwrite.
+  Joiner skipped the create-a-character prompt ("loaded a char and went to the new start process") but
+  the HOST dropped ITSELF from its player list — reverted at the time and blamed on the rule. WRONG
+  blame: that was the PlayerData clobber (next section); the rule is reinstated and correct.
+- Kept (Photon-correct): the first `JoinGame` response now carries the room's current game properties
+  (only the repeated-join path did before; the client seeds `Room.CustomProperties` from it).
+- Ops: a Ryujinx joiner instance (`ryujinx-instances/joiner`, account OutboundJoiner) left running from
+  13:57 was consuming the joiner's invitations (its log shows `TryPopFromFriendInvitationStorageChannel`)
+  — invites "randomly" not arriving on citron. Kill any other process logged in as the joiner account.
+  Also: the citron toast click is the accept; the joiner must be on the multiplayer menu; a second
+  manufactured join in the same citron process crashes it ("Uncaught C++ exception" right after
+  `Join returned state machine`) — relaunch the joiner citron for every join. Citron's log writer buffers
+  ~1 min, so a stalled `citron_log.txt` does NOT mean a frozen frontend.
+
+### 2026-09-06 (night): the "works sometimes" root cause — clients clobber the PlayerData structs; sticky knownPlayers reinstated; fresh AND returning joins work
+
+**The dump answered the original question.** `FusionServerFactory.Dump` now prints each PlayerData
+struct's `P=<player> O=<object> A=<actor>`. In every failing room the host's own struct read
+`P=[Player:1] O=[Id:None]` even though the server had logged its `SetPlayerObject` as applied (a
+read-back right after the write shows `O=[Id:525312]`). Cause, from the 2.0.8 decompile:
+`StateReplicator.SendPacket` returns early only for `Topology != Shared && Mode == Client`, so
+**Shared-mode clients run `WriteStructs` too** and periodically send their copies of RuntimeConfig,
+SceneInfo, PhysicsInfo and every PlayerData struct to the server; the server's `ReadObjectUpdates`
+takes any struct snapshot (`Type.IsStruct → snapshot.CopyTo(meta)`, no authority check). A client's
+copy taken before the link was applied carries `Object=None` and wipes it; last writer wins, which
+is why TY546E worked and USNJ3E/8QYJ8E/WEW9KE did not. Every client's `Runner.GetPlayerObject(host)`
+is then null → the host is missing from its own player list and `OnOtherPlayerJoined` never runs.
+**Fix:** the server records each player's object from `SetPlayerObject` and re-asserts it in
+`OnBeforeTick` (`[FusionHost] PlayerData [Player:N] Object clobbered -> re-asserted …` — exactly one
+per player per room, at ticks ~80 and ~join+50). `PlayerLeft` forgets it. Rooms 4YXD7E (fresh) and
+UKTY4E (returning): links hold, host lists both, 110-RPC init burst every time.
+
+**Joiners keep no local save.** With `log_filter="*:Debug"` on the joiner profile (set in its
+`qt-config.ini` while citron was closed), a "Save and Quit" from a joined session wrote ONLY
+`Settings/settings.local|synced`; nothing under `Savegames/`. So the character lives in the host's
+world save and the joiner decides new-vs-returning from the room's `knownPlayers` at join → the
+**sticky knownPlayers rule is reinstated** (`RoomRegistry.SetProperties`: an empty overwrite never
+clears a non-empty list; the broadcast payload is patched to the kept value; test
+`SetProperties_keeps_non_empty_knownPlayers_over_an_empty_overwrite`). The first-join `JoinGame`
+response also carries the room's game properties now (Photon-correct; only the repeated-join path
+did before). In UKTY4E the joiner was handed `knownPlayers=<its hash>` at join, was NOT asked to
+create a character, and its character loaded; the host still ran the fresh-init burst (its
+`FindSerializedNetworkPlayer` found nothing — the host's "save and quit" after the joiner left did not
+serialize it), and the joiner spawned beside the host in the campervan, which is the game's normal
+arrival placement. Position persistence for joiners would need the host's serialized record; not
+pursued.
+
+**Ops:** `scripts/restart-photon.sh [tag]` — SIGTERM hangs the Generic Host shutdown (listener loops
+or Fusion's native socket threads ignore it), the process keeps the ports, and `start-services.sh`
+then silently skips the start (this bit us four times today). The script SIGKILLs the port owner,
+archives the log under the tag, starts fresh, verifies. `InRoomDeadTimeoutSeconds` must be ≥
+`DeadTimeoutSeconds` (600 in the rig) — pass `BLACKICE_Server__Listener__InRoomDeadTimeoutSeconds=600`
+to clear ghost rooms in 10 min instead of 30. Kill other processes logged in as the joiner account
+(a leftover Ryujinx joiner ate invitations). Relaunch the joiner citron for every join. The
+`FUSION_SETPLAYEROBJECT_DELAY_TICKS` experiment env is still in the code (default 0 = off); remove it
+when convenient.
+
+**Open / next:** (1) pickups both ways (no `RequestStateAuthority` internal message has been observed yet
+— if pickups don't sync, look at the RPC path first, then the authority handler); (2) pre-join world state
+on the joiner; (3) returning join (joiner logged out, host saved — user is testing this next);
+(4) `PlayerSimulationData.Actor` is never set by the SDK server (plugin does it) — cheap to set in
+`PlayerJoined` if something reads `GetPlayerActorId`; not done (one change per round).
+Logs: `services/earlier-photon-0906-{preinternal-DTS8AE,internalmsg-6CWGVE-RF3RUE,trace-KLJMTE,dump-GWP4CE}.log`
+and the live `earlier-photon.log` (TY546E). earlier-photon uncommitted: EnetPeer.cs, NCommand.cs,
+TransportTests.cs, FusionServerFactory.cs, FusionSharedServer.cs, docs/fusion-shared-server.md.
 
 ## NEXT SESSION — concrete plan (Fusion gameplay transport)
 
