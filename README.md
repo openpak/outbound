@@ -29,8 +29,8 @@ self-hosted [`earlier-photon`](../earlier-photon) server (citron redirect
 `OPENPAK_PHOTON_IP`) plus the `legacy-local` account stack. That server
 hosts Fusion's own Shared-mode `Simulation.Server` per room (headless, from
 the game's exact Fusion 2.0.8 build). As of 2026-09-06 two citron players
-share one world: fresh and returning joins both work, objects, RPCs and room
-properties are relayed, and both players see each other (see the dated sections
+share one world: fresh and returning joins, leaving (avatar removed) and
+rejoining, pickups both ways and pre-join world state all work (see the dated sections
 at the end of `HANDOFF.md`; `restart-photon.sh` restarts the server reliably).
 Testing scripts live in `scripts/` (start with `start-services.sh`, then the
 two `launch-citron-*.sh` wrappers; `auto-invite.sh` sends the joiner an invite

@@ -3628,122 +3628,74 @@ Logs: `services/earlier-photon-0906-{preinternal-DTS8AE,internalmsg-6CWGVE-RF3RU
 and the live `earlier-photon.log` (TY546E). earlier-photon uncommitted: EnetPeer.cs, NCommand.cs,
 TransportTests.cs, FusionServerFactory.cs, FusionSharedServer.cs, docs/fusion-shared-server.md.
 
-## NEXT SESSION — concrete plan (Fusion gameplay transport)
+### 2026-09-06 (late night): pickups both ways, pre-join state, and the leave/rejoin chain (ghost + "first arrival") fixed
 
-**Goal:** a session that holds and plays past ~15 s with two players, now that a real Fusion
-Shared-mode SERVER hosts the room (built this session — see the section just above). The success
-criterion is unchanged: both peers stay in the room exchanging gameplay well past the point the old
-solo-echo relay died, joiner not frozen. Do NOT declare success on `actor=2` alone.
+**Pickups sync over RPCs, both directions; no authority transfer involved.** Drop = one RPC on the
+world object `525314` (`beh=55 method=1`); pickup = `beh=55 method=2` on the world object plus
+`beh=4 method=1` on the picker's own avatar. Host→joiner and joiner→host identical. Closed.
 
-### FIRST: produce the Fusion libs and build with them
-The Fusion host is an OPTIONAL build; a fresh checkout has no `server/fusion-libs/`. Reproduce it per
-`earlier-photon/docs/fusion-shared-server.md` (copy the 2.1.x Fusion DLLs + Linux `libnanosockets.so`,
-build `Photon.Realtime.dll` from the package sources, patch `Fusion.Runtime.dll` with
-`tools/fusion-patcher`). The libs used this session are staged at `~/photon-oracle/` and
-`~/REPOS/earlier-photon/server/fusion-libs/` (gitignored) — reuse them. Confirm `dotnet build` reports
-the Fusion project built (not skipped), then restart earlier-photon.
+**Pre-join world state is fine.** An item the host dropped before a joiner arrived was on the
+ground in the joiner's world, and the joiner could pick it up. Closed.
 
-### THEN: live host + join, and read what the hosted server does
-Same rig as always (§0 below). Host a session on citron/Ryujinx, `scripts/send-test-invite.sh <CODE>`,
-accept on the citron joiner. Watch, in order:
-1. **Both peers reach the GameServer and the hosted sim gets them.** photon log: `EnterRoom actor=1`
-   then `actor=2`; and the new Fusion host should now be receiving 101 packets (add a temporary
-   `Log` in `FusionSharedServer.FeedRelay`/`RoomSim.Tick` if needed — it currently logs only Fusion's
-   own Warn stream; raise `FusionServerFactory.EnsureLogInitialized` to `LogLevel.Debug` +
-   `TraceChannels.Network` for bring-up).
-2. **Protocol-version match.** Outbound speaks Fusion message version 10 (`V1_6_0`); the 2.1.2 SDK is
-   built as 12 but still supports 10 per-message. The SIMULATION packet layer (NotifyData/word lists) is
-   NOT per-message-versioned. If the live client desyncs at the object layer (client logs "failed to
-   create instance" or drops right after Start despite the PluginVersion patch), the SDK minor is wrong:
-   get the matching **Fusion 2.0.x** package and rebuild `server/fusion-libs/` from it (the patch +
-   UnityStub are version-independent; only the DLLs change).
-3. **Session holds.** The old death was the host sending `NetCommands.Disconnect(Timeout)` ~15 s after
-   the relay went unanswered. With a real server answering NotifyData, that timeout should not fire.
+**Leave/rejoin was broken in two server-side places (earlier-photon `56c8c68`):**
+1. `RoomSim.RemovePlayer` only dropped the actor from its own set. Fusion's simulation was never
+   told, so the leaver's PlayerData struct and avatar stayed, no client ever got `PlayerLeft`, and a
+   returning player came back beside its own body, treated as a first arrival. The cloud plugin's
+   leave-time step is `Simulation.Server.Disconnect(player)`; `FusionServerFactory.DisconnectPlayer`
+   now does that (log: `room "X" player N left -> sim disconnect`). Effect chain, all observed live:
+   sim deletes PlayerData → host's `NetworkManager.OnPlayerLeft` sends `RequestStateAuthority` for the
+   leaver's avatar (first time this message ever appeared) → server grants (`[Player:2] -> [Player:1]`)
+   → host's `NetworkPlayer.StateAuthorityChanged` (decompile: `if (!HasStateAuthority) return; …
+   Runner.Despawn(Object)` inlined, flags=10) despawns the adopted avatar.
+2. That despawn arrives as an object-destroy entry in the host's packet. `ReadObjectDestroys` hands it
+   to `ICallbacks.RemoteObjectDestroyed`; our `NoopCallbacks` returned `true` ("handled"), so the
+   simulation never freed it and the body lived on under the host's name. Now returns `false` (log:
+   `remote destroy [Id:N]`), so `Simulation.Destroy` frees it and forwards the destroy to every client
+   (the Unity runner's `_remoteDestroyQueue` does exactly `_simulation.Destroy(id, DestroyState)` too).
+   A `remote destroy [Id:1025]` (the leaver's own PlayerData struct) also appears one second before its
+   `OpLeave`: that is the leaving client tearing down on shutdown; benign.
 
-### If the object layer disagrees (fallback plan)
-The headless proof used two SDK clients, which frame identically to the server. The live Outbound client
-is the same Fusion build as the game, so the risk is only the SDK-minor mismatch above. If rebuilding
-from 2.0.x still disagrees, capture one live 101 NotifyData packet from the host and compare its word
-layout to what the hosted server expects (both are `StateReplicator` — diff the two `Fusion.Runtime`
-versions' `ReadObjectUpdate_GetWords`/`WriteObject_WriteData`). This is the same observe-then-adjust loop
-used all project, now with a real server on our side instead of a hand-rolled relay.
+Result (room XQ9QAE): join, quit → avatar vanishes on the host at the quit, relaunch, re-invite, rejoin
+→ no ghost, object list holds exactly the host's avatar and the returning joiner's new one. User: "works
+100%".
 
-### 0. Environment (unchanged, all working)
-- Services: `scripts/start-services.sh` (legacy-local account container :8099,
-  photon `dotnet run` on 27000-27002 with the 600 s / 1800 s timeouts).
-- citron: shared personas `~/.local/share/citron/{host,joiner}` via
-  `scripts/launch-citron-{host,joiner}.sh`. Both sign into OutboundHost/Joiner.
-- Join trigger: host a session (NEVER click the native Invite-Friends applet on
-  citron — SIGSEGV), then `scripts/send-test-invite.sh <CODE>` and accept the
-  toast on the joiner. The room code is in photon log `EnterRoom "<code>" actor=1`.
-- Rebuilt binary picks up the two citron fixes (injection stuck-stage reset,
-  `F_GETFL` assert) — relaunch citron after any `ninja citron citron-cmd`.
+**Rejoin position / "Day 1" card / "ZT to start the motor" are the game's own behaviour, not a missing
+message.** Verified from the decompile and the log:
+- The host's join-time sync to the joiner is byte-for-byte the same set of targeted RPCs on a fresh
+  join and on a return (110× `beh=27 m=2`, 2× `beh=47 m=2` of 496/336 bytes, etc.).
+- `SerializedNetworkPlayer` (what `LoadManager.FindSerializedNetworkPlayer` returns and
+  `NetworkSaveSync.OnOtherPlayerJoined` pushes via `Initialize{PlayerStorage,PlayerBackpacks,
+  PlayerTools,PlayerUpgrades,PlayerNeeds,InteractionTasks,ToolTasks}Rpc`) has no position.
+- Nothing in the game re-takes an old avatar: `NetworkRunner.Spawn` is called only from
+  `NetworkManager.OnConnectedToServer` (plus critter/robot/companion spawners), and the only game
+  caller of `RequestStateAuthority` is `OnPlayerLeft`. A returning joiner always gets a fresh avatar at
+  the campervan, which is where the start-motor prompt lives.
+- Not verified against Photon Cloud: whether the "Day 1" intro card also shows on a Cloud rejoin
+  (`SceneHandler.GetSkipIntroTexts` is a plain field; who sets it was not traced).
 
-### 1. FIRST: capture two-peer ground truth (we can finally generate it)
-All prior transport work was reverse-engineered from a SOLO host. Now that the
-handshake reaches actor=2, do a real two-peer run and capture what the peers
-exchange in the 120 s before the timeout — this is the missing input for the
-relay addressing. From EACH citron log (`user/log/citron_log.txt`), collect:
-- Every `[OpenPak][PHOTON]` line with `type:11` / event-code 100 & 101 to
-  :27002 (the Fusion relay), both TX and RX, both peers.
-- The PRUDP-Lite socket: `ss -tunap | grep <pid>` gives the `UNCONN
-  0.0.0.0:<port>` P2P socket; capture what (if anything) each peer sends to the
-  other's P2P port, and what `DescribePrudpLite` logs for each.
-Save raw captures OUTSIDE the repos (pool: `/mnt/media/research/outbound/`).
+**Ops notes:** `restart-photon.sh` can report "photon NOT up" while `dotnet run` is still compiling;
+check `ss -lun | grep 27000` before believing it. Photon log timestamps are UTC (local is +01:00).
 
-### 2. Blocker A — PRUDP-Lite P2P socket freeze (the joiner freeze)
-Each peer binds `UNCONN 0.0.0.0:<ephemeral>` for Nintendo PRUDP-Lite P2P and
-blocks forever on `recvfrom()` (single-threaded bsdsocket → whole game freezes).
-Proven earlier: sending a *valid* PRUDP-Lite `SYN`+`CONNECT` from a PERSISTENT
-socket releases it and advances the client; 16 zero bytes releases it but the
-game then shuts down (invalid). Plan:
-- Implement a PRUDP-Lite P2P **bridge in citron** (`bsd.cpp`, next to
-  `DescribePrudpLite`): when a peer sends a PRUDP-Lite packet to its intended P2P
-  destination, forward it to the OTHER local peer's P2P socket (both are on
-  127.0.0.1; the two peers are separate citron processes, so bridge via a small
-  shared channel — a loopback relay port, or a file/UDS the two citrons agree on
-  via an env var). Simplest first cut: a tiny UDP relay both citrons forward
-  their PRUDP-Lite traffic through, keyed by the room.
-- Alternatively/first: make the recvfrom non-blocking so the game doesn't freeze,
-  and see whether it falls back to relay-only — but earlier evidence says it
-  needs the P2P to succeed, so a bridge is likely required.
+## NEXT SESSION — concrete plan
 
-### 3. Blocker B — two-peer Fusion relay (event 101) addressing
-`GameServerHandler` answers the relay Connect with a **solo-host self-loopback**
-`NetCommandAccepted` and only relays 101 DATA to other actors when
-`Session.Count>1`. For two peers this is wrong: each peer needs a distinct
-`NetConnectionId` (Group/GroupIndex/Generation), and the Accepted must hand each
-peer the OTHER's id so the relay can route between them. Implement from the §1
-capture:
-- Decode both peers' `NetCommandConnect` (their UniqueIds) and give each a
-  distinct connection id; reply `NetCommandAccepted` with the real remote id
-  (not the {0,0,1} self-loop) — see `FusionRelayProtocol` / `FusionProtocol.cs`.
-- Forward each peer's ongoing 101 DATA to the OTHER peer with the correct
-  source/target ids (not echo-to-sender). Add fixtures like
-  `FusionRelayProtocolTests` from the captured two-peer bytes.
-- Expect to also need `ReflexiveInfo`/`PlayerRefMapping`/`ChangeMasterClient`
-  (HANDOFF "Next step" pt 3) once basic routing works.
+Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
+`launch-citron-host.sh` / `launch-citron-joiner.sh`, host a session, `send-test-invite.sh <CODE>`
+(code from `EnterRoom "<CODE>" actor=1`), accept on the joiner. Relaunch the joiner citron for every
+join. One behaviour change per round; ask what the user sees before changing anything.
 
-### 4. Validate
-Two-peer run; success = both stay in-room exchanging 101 past 120 s, joiner not
-frozen (`ss` shows no stuck `UNCONN recvfrom`; joiner log keeps advancing). Only
-then is any "two-player" claim honest.
+Everything on the transport side that has been tested now works: fresh join, returning join,
+continuity (7+ min), pickups both ways, pre-join state, leave (avatar removed), rejoin (no ghost).
+Candidates, in order of value:
+1. **Longer play session** (30+ min, both players moving, driving, building). Watch for desyncs,
+   `Not handling RPC` storms, memory growth of `BlackIce.Server` (was 495 MB after 12 min of one
+   room; check `ps -o rss`).
+2. **Host quits while the joiner stays** (master-client migration). `ElectMaster` re-elects the
+   lowest actor; the game's reaction to `IsSharedModeMasterClient` flipping is untested.
+3. **Three players.** `RoomSim` is built for up to 8; only two have ever been in a room.
+4. **Vehicles and building** (`NetworkVehicleDriverSync`, `NetworkFoundationSync`, …): the RPC
+   forwarder is generic, but interest/authority on those objects is untested.
+5. Housekeeping: remove the `FUSION_SETPLAYEROBJECT_DELAY_TICKS` experiment; `RoomRegistry`'s
+   `ActorNumbers` never shrinks on leave (`occupants=[1,2,3]` after actor 2 left) — harmless today
+   because master election happens in `RoomSim`, but wrong.
 
-### Uncommitted at session end (commit under <user-a>, per-repo, NO AI attribution)
-The earlier-session items (GameProperties join fix + eviction/timeout hardening in
-`earlier-photon`, the citron `legacy_guest_call.cpp`/`bsd.cpp` fixes) were COMMITTED last
-session (`earlier-photon` HEAD `6e64f4b`, `earlier-citron` `8c523f162`). New this session,
-uncommitted:
-- `earlier-photon` (the Fusion Shared-mode server — see docs/fusion-shared-server.md):
-  new projects `server/BlackIce.Server.Fusion`, `server/BlackIce.Server.Fusion.UnityStub`;
-  `server/BlackIce.Server.LoadBalancing/IFusionSessionHost.cs`; edits to
-  `GameServerHandler.cs`, `BlackIce.Photon/FusionProtocol.cs` (`UniqueIdForActor` + deterministic
-  Join-Confirmation id), `BlackIce.Server.Core/UdpListener.cs` (`OnTick` hook),
-  `BlackIce.Server.Host/{ListenersHostedService.cs,*.csproj}`, `BlackIce.Server.sln`;
-  `tools/fusion-patcher/`; `docs/fusion-shared-server.md`; `.gitignore` (fusion-libs, *.so).
-  NB `server/fusion-libs/` is gitignored and MUST NOT be committed (copyrighted Fusion DLLs).
-  Suggested commit scope: `feat(fusion): host Fusion Shared-mode server for two-peer relay`.
-  One PRE-EXISTING test fails (`RoleHandlerTests.NameServer_authenticate…`), unrelated.
-- `earlier-outbound`: HANDOFF (this file).
-- Research artifacts live outside the repos at `~/photon-oracle/` (SDK DLLs, decompiled Fusion,
-  the `fusionhost/` bring-up spike incl. the two-client proof) — copyrighted, never committed.
+Uncommitted at session end: nothing. earlier-photon HEAD `56c8c68`; this file.
