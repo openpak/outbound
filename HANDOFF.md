@@ -1,6 +1,25 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-09-02 (night). **BREAKTHROUGH: a real two-player Outbound session ran
+Last updated: 2026-09-06. **CONTINUITY IS FIXED — a two-player session now HOLDS INDEFINITELY
+(7+ min, no drop), but the two clients are in SEPARATE WORLDS: no game state replicates.** The
+~2-min drop was our own bug: `RoomSim.Tick` gated on the joining thread id, but the listener loop
+is async and hops pool threads, so the hosted sim froze whenever the pool parked that thread (20 s
+gap → Fusion Disconnect(Timeout)). Fixed by keying tick ownership on the listener LOOP via
+`UdpListener.Current` (an AsyncLocal), committed as `earlier-photon` `39dbda3`. With that, a live
+host+join held from tick 0 past tick 19000 with zero drops. **The NEW wall is state replication:**
+the hosted `Simulation.Server` THROWS parsing each client's spawned-object stream —
+`StateReplicator.ReadObjectUpdates` logs `Object does not exist: [Id:...], marked as confirmed —
+invalid data from the remote host` then overflows the `NetBitBuffer` in `SkipObjectData`. It never
+creates the players' objects, so it forwards only 26-byte header-only NotifyData (server→client
+stays 26/27 B the whole session; the join-time 117 B burst is just RuntimeConfig). Root cause:
+the headless generic server has no `NetworkProjectConfigAsset.SerializableSimulationBehaviourMeta`
+(Outbound's per-behaviour serializer/word-layout table, confirmed present in its IL2CPP dump), so it
+decodes the client's COMPRESSED object words with generic per-word varint readers, desyncs, and
+overflows. See the 2026-09-06 section at the end for the full diagnosis and the two candidate paths.
+Also: the server LEAKS memory on long runs (a headless Fusion sim reached **14.4 GB** RSS over the
+night's runs and OOM-starved the machine, wedging both citrons; a fresh server is ~0.3 GB). Restart
+the server between long runs until that's fixed. **(Earlier top-of-file status, now historical:)**
+**BREAKTHROUGH: a real two-player Outbound session ran
 for ~2 minutes** — both peers spawned into the game and authored state through our self-hosted
 Fusion server — after rebuilding fusion-libs from Fusion 2.0.8 (Outbound's exact version). The
 2.1.2 SDK's V2/250 transport was the wall; 2.0.8 uses NotifyData(3) which the client reads. Both
@@ -3058,6 +3077,104 @@ Diagnose by capturing the ~2 min window (same pcap pipeline) and watching what c
 go silent — does our server stop sending 26 B NotifyData, do the clients stop acking, does a Disconnect
 (NetCommands.Disconnect / event-100 msg4) appear, or does time-sync (event 100 or the tick numbers)
 diverge. The whole rig is unchanged; just re-run host+join and read the last ~10 s before the drop.
+
+### 2026-09-05: the ~2 min drop ROOT-CAUSED from the existing capture — our tick loop stalled 20 s (thread-id affinity vs an async loop); fixed, live re-run pending
+
+No new live run was needed: `ours-208-230611.pcap` + `earlier-photon.log` (archived as
+`services/earlier-photon-2208-tickstall.log`, room `9BX5CE`) already contained the drop. Decoded with
+`~/photon-oracle/pcapdecode --all` (pcap clock is +1 h vs the server log).
+
+**Timeline (server-log clock):** host `46247` in at 22:07:39, joiner `58168` at 22:08:21; both stream
+state, server streams 26–27 B NotifyData at ~30/s per client. At **22:09:55.7 the server stops emitting**
+(last `raise Ev(101)` msgid=3). Clients keep sending state for 15 s, then go acks-only at ~22:10:05 and
+silent at 22:10:10.8. At **22:10:15.86 the server sends both clients a 136 B `01 04 02…`** = NetCommand
+**Disconnect, reason 2 = Timeout** — the hosted Fusion sim itself kicked them. Then the sim burst-ticks
+(8874 → 10163 in ~2 s) to catch up ~20 s of lost time. NOT a client timeout, NOT time-sync drift, NOT the
+relay: our `Simulation.Server` simply was not ticked for 20.7 s.
+
+**Why:** `RoomSim.Tick` guarded on `_ownerThreadId == Environment.CurrentManagedThreadId`, set at Join.
+But `UdpListener.RunAsync` is an `async` loop — every `await ReceiveAsync` resumes on whatever pool
+thread is free, so the "listener thread" is a fiction (log thread tags t8/t11/t15/t16/t18/t21/t23 all
+interleave). Ticks only happened on iterations that landed on t15 by luck (also why the tick rate read
+56–66/s instead of a steady cadence). Thread t15 appears in ZERO log lines from 22:09:56 to 22:10:14 (the
+pool parked it) and reappears at 22:10:15 — exactly the stall window. `[FusionHost]` once-per-second
+lines stop/resume on the same boundaries.
+
+**Fix (earlier-photon, committed):** `UdpListener.Current` — an `AsyncLocal<UdpListener>` set at the
+top of `RunAsync`, so it flows to every continuation of that loop regardless of thread. `RoomSim` now
+records `_owner = UdpListener.Current` at Join and ticks only when `ReferenceEquals(_owner,
+UdpListener.Current)`; the game/gameAlt dual wiring stays safe. Test:
+`UdpListenerMaintenanceTests.Current_identifies_the_loop_across_thread_hops` (ticks land on several
+threads, `Current` is always the listener, null off-loop). Full suite: only the PRE-EXISTING
+`NameServer_authenticate…` failure remains.
+
+**Next:** re-run host + join (same rig, §0 below). Expect: `[FusionHost]` lines every second with a
+steady tick rate, no 20 s gap, session holding well past 3 min. If it still drops, read the last 10 s
+before the drop the same way (per-second `raise Ev(101)` counts + thread tags + `[FusionHost]` cadence).
+
+### 2026-09-06: CONTINUITY CONFIRMED FIXED live (7+ min hold); the new wall is STATE REPLICATION — the server can't parse client objects; plus a 14.4 GB server memory leak
+
+Ran the tick-ownership fix live (two rooms: `DHPHCE`, then `J6HM3E` after a memory-forced restart).
+**Continuity is solved:** `J6HM3E` held `players=2` from tick 0 past tick 21000 (7+ min) with a
+STEADY ~64 ticks/s and zero Disconnect — the 20 s stalls are gone. `[FusionHost]` heartbeats are
+regular now. That closes the "~2 min drop" chapter for good.
+
+**But the two clients are in completely separate worlds** (user: "like they aren't playing the same
+game" — different time-of-day, can't see each other). Diagnosed end-to-end from the server log:
+
+- **Server→client 101 is 26/27 B for the entire session** (header-only NotifyData, zero object
+  words). Only exception is a one-time ~117 B burst at join = RuntimeConfig/SceneInfo. Clients DO
+  author real state upward (22 B keepalives + 34–60 B deltas + a 289–294 B spawn burst each), and
+  the sim's `fed` counter climbs — so the server RECEIVES their state and just never re-emits it.
+- **Why:** the hosted `Simulation.Server` THROWS while parsing the client object stream. Server log
+  (`blackice-server-*.log` / `earlier-photon.log`) shows, at spawn time:
+  `Object does not exist: [Id:525312], but is marked as confirmed. This indicates invalid data from
+  the remote host`, followed by a `NetBitBuffer` overflow with stack
+  `StateReplicator.ReadObjectUpdates → SkipObject → SkipObjectData → NetBitBuffer.ReadInt64VarLength`.
+  So the server never creates the players' objects (`_metaLookup` lacks them) and has nothing to
+  forward → 26 B headers forever.
+- **Root cause (high confidence):** the headless generic server has NO game serializer registration.
+  Outbound's IL2CPP dump has `NetworkProjectConfigAsset.SerializableSimulationBehaviourMeta` (the
+  per-behaviour word-count + serializer table) and a `FusionSerializationVersion` field on its
+  protocol struct. Client objects encode words through COMPRESSED serializers (e.g. `NetworkTRSP`
+  quantized position/rotation). Our `NetworkProjectConfig` is empty, so `meta.Serializers` is default
+  → `ReadObjectDataIntoPtr`/`SkipObjectData` read each word as a plain `ReadInt64VarLength(6)` →
+  wrong bit count → desync → "object does not exist" on the follow-up update → overflow. Confirmed
+  the failing path is exactly `StateReplicator` object read, not the transport (transport holds).
+
+**Two candidate paths for next session (pick after a decision — they're materially different):**
+1. **Give the headless server Outbound's serializer registration.** Extract the weaver-generated
+   per-type/word serializer table from `SerializableSimulationBehaviourMeta` (+ the prefab/type ids)
+   in the IL2CPP dump and register it into the `NetworkProjectConfig` the server builds in
+   `FusionServerFactory.CreateServer`. Biggest unknown: whether the generic `Simulation.Server` even
+   consumes a data-driven serializer table without the game's compiled `NetworkBehaviour` types, or
+   whether it needs the actual weaved managed types (which we don't have on .NET). This is the
+   "make the server understand the game" path.
+2. **Verify how real Photon Cloud's plugin does it, then match.** We have NOT captured a real
+   two-client Cloud session — only solo. Capture one (two Steam clients, unredirected Cloud, the
+   proven `/etc/hosts` + tcpdump technique) and check the server→client 101 sizes: if Cloud ALSO
+   sends only header-sized packets and the two Steam clients still share a world, then Shared-mode
+   object relay is peer-to-peer via the plugin echoing OPAQUE blobs (not re-serialized), and our
+   server should relay each client's object bytes verbatim to the other WITHOUT running
+   `ReadObjectUpdates` at all — i.e. bypass `StateReplicator` parsing for peer objects. This is the
+   "server stays a dumb relay" path and is likely much smaller if the capture supports it.
+
+Recommendation: do (2) FIRST (one capture settles whether the server must parse or just relay), then
+either register serializers (1) or switch to opaque relay. Do NOT keep guessing at the parser.
+
+**Memory leak (fix before any long soak):** over the night's cumulative runs one `BlackIce.Server`
+process reached **14.4 GB** RSS and drove the 29 GB machine to 1 GB free, which OOM-wedged both
+citrons (host could only make one aborted NameServer connect → "spinning wheel"). A freshly started
+server is ~0.3 GB and a single 7-min session stayed ~0.3 GB, so the leak is gradual/cumulative
+(suspect: per-room `Simulation` snapshot timelines or `RelaySocket` inbound queues not draining, or
+rooms not disposed on `PlayerLeft`). Mitigation for now: restart the server (`scripts/start-services.sh`)
+between long runs. Start it DETACHED (`setsid nohup … < /dev/null &`) — the harness kills a normal
+child process group on a low-memory event, which took the server down mid-session twice tonight.
+
+**Unproven idea left OUT of the tree:** a `ScheduleAllObjects` sweep (register every object on every
+connection's send schedule each tick) was written and REVERTED — it can't matter until objects parse
+(nothing to schedule), so it wasn't committed. Re-add it only if path (1) makes objects parse and
+they still don't forward.
 
 ## NEXT SESSION — concrete plan (Fusion gameplay transport)
 
