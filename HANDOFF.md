@@ -3676,6 +3676,24 @@ message.** Verified from the decompile and the log:
 **Ops notes:** `restart-photon.sh` can report "photon NOT up" while `dotnet run` is still compiling;
 check `ss -lun | grep 27000` before believing it. Photon log timestamps are UTC (local is +01:00).
 
+**Save file decrypted; the joiner IS persisted and IS recognised.** `FileSystemWriter.SaveToFile` writes
+base64(AES-CBC(zero IV, PKCS7, key = UTF-8 of the static `FileSystemWriter.pwdKey` literal)). The key was
+recovered by trying every 16/24/32-byte string literal from the IL2CPP dump against `fresh.save`; the
+decryptor lives on the pool at `/mnt/media/research/outbound/tools/decrypt-save.py` (key inside,
+never in a repo). The host's save has `NetworkInfo.Players[]` with `UserID:"OutboundJoiner"`,
+`TargetPlatform:5`, storage/backpacks/tools/upgrades/needs/customization and `LastSeen` — and no position.
+World: `CurrentDay:2`, `DayAtLevelEntry:1`.
+
+**`beh=42` on the world object is `NetworkSaveSync`** (weaved ids from the decompile: 1 InitializePlayerStorage,
+2 Backpacks, 3 Tools, 4 Upgrades, 5 Needs, 6 InteractionTasks, 7 ToolTasks, 8 RequestInitialization,
+9 RequestToggleInitialized). On EVERY join today (fresh-of-session and returning) the host sent the joiner
+methods 1–8 = the "serialized record FOUND" path; method 9 (record not found) never appeared. So the joiner
+is recognised and its inventory restored each time; the campervan placement and the "Day 1" card are the
+game's ordinary joiner arrival, not a first-timer path. Whether the card's "Day 1" is the level-entry day
+(`DayAtLevelEntry`=1) or the local day before `NetworkDaySync` applies the host's value is not yet pinned
+(`BlackscreenUI.GetIntroTexts` just picks one of two text sets by a static mode flag). Check: the joiner's
+in-world day after the card should read 2.
+
 ## NEXT SESSION — concrete plan
 
 Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
