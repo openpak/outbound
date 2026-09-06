@@ -3743,6 +3743,39 @@ NPLN server, bridged to the invitation mailbox; (2) read the game's `nn::friends
 session-invite `message_type` + field keys (payload bytes = what citron already relays); (3) friends+presence
 partly exist -- ensure the joiner shows invitable; (4) defer NPNS/Penne. Then cross the injection bridge (#1).
 
+## Real-hardware path, CORRECTED (2026-09-06 late night)
+
+**The previous section's server scope is wrong for Outbound.** Its decomp
+(`/mnt/media/research/outbound/decomp`) has ZERO `npln` references and 180+ `nn.friends` ones
+(`SendFriendInvitation`, `FriendInvitationGameModeDescription`, `NotificationQueue`). NPLN Messaging is the
+transport for NPLN titles (Splatoon 3, Stardew); Outbound never links NPLN. On a real console:
+
+- `nn::friends::SendFriendInvitation` = IFriendService cmd 30900 (V1) / 30901 (V2, 19.0.0+), handled by the
+  system **friends sysmodule**, whose server is **BAAS** (`e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com`,
+  user-agent `nnFriends`; the account sysmodule moved to `m-lp1.baas.nintendo.com` on 21.0.0, friends did not).
+- kinnay's BAAS-Server page lists `/2.0.0/friend_requests`, `/2.0.0/users/<id>/friends`, blocks, generate_code
+  -- **no invitation route**. The invite send endpoint + body are undocumented. Recipient receives it by push
+  (NPNS/XMPP before 18.0.0, Penne HTTP/2+JSON after; the third-party setup already redirects `val.hac.penne` and
+  `god.hac.lp1.penne`) into the friends sysmodule's invitation storage channel, which the game pops.
+- Locally there is NO BAAS implementation: openpak-account serves the Reference API and derives synthetic
+  BAAS/NA ids; the 443 SNI for the BAAS host goes to `baas-jwks` (JWKS only). The real-console BAAS is
+  `nx-account` on the org's production deployment (the third-party setup's `OPENPAK_SERVER_IP_DEFAULT` = 51.178.29.194).
+  Photon identifies a real Switch by the token's `bs:did` claim (`OpenPakIdentityRegistry.cs`).
+- the third-party setup's DNS-mitm host list has no `ns.photonengine.io` entry yet (`console patches/source/legacy_hosts.c`);
+  hardware Photon needs it pointed at the machine running earlier-photon (LAN 10.87.0.2 here, ports
+  5055/5056/27000-27002 UDP, binds 0.0.0.0).
+
+**Concrete hardware plan, evidence-first:**
+1. Milestone A: a real console reaches our Photon and HOSTS an Outbound room (add the photonengine host to
+   the third-party setup, keep account/BAAS on whichever deployment the console is already linked to). Validates that the
+   whole Fusion server work holds on hardware -- independent of invites.
+2. Milestone B: press Invite Friends on hardware with BAAS pointed at a server we log; capture the exact
+   friends-sysmodule request (path, headers, body = the 0xC00 `FriendInvitationGameModeDescription` /
+   11-byte app param). That capture defines the endpoint to implement; no protocol doc will.
+3. Milestone C: receiver side -- push (Penne) into the second console's storage channel, then the injection
+   bridge (or surfacing `JoinUI`), since the game's invite-consume is a dead wire everywhere.
+Do NOT build NPLN Messaging for Outbound.
+
 ## NEXT SESSION — concrete plan
 
 Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
