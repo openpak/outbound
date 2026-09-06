@@ -3776,6 +3776,56 @@ transport for NPLN titles (Splatoon 3, Stardew); Outbound never links NPLN. On a
    bridge (or surfacing `JoinUI`), since the game's invite-consume is a dead wire everywhere.
 Do NOT build NPLN Messaging for Outbound.
 
+## Console rig built (2026-09-06, late night): local 1:1 earlier stack + BAAS server + the third-party setup LAN option
+
+User decisions this session: real consoles (two, with Outbound) use THIS machine's stack; invites go
+through the **standard Switch functions** (friends sysmodule -> BAAS); **no custom sysmodule, no
+patches, ever**. The org's real-console BAAS server (`nx-account`) is private and unavailable
+(not in earlier network's GitHub, user not a member, not on disk; NeXo-Server and Pretendo do not
+implement it either), so it was rebuilt as **`~/REPOS/nx-baas`** (Go, stdlib, one binary, style of
+nx-dauth) from kinnay's NintendoClients docs (BAAS-Server, Account-Server-(Switch), baas.py) and
+openpak-account's `/internal/*` contract.
+
+**What runs now (legacy-local, podman compose):**
+- `nx-baas` :18447 -- BAAS (`e0d67c...baas.nintendo.com`, `m-lp1`, `cdn-image-*`) + Nintendo
+  Account (`accounts.nintendo.com`, `api.accounts.nintendo.com`). Data `data/nx-baas/baas.json`.
+  Signs id_tokens with `openpak-baas-key-1` + `openpak` claim (same HMAC as openpak-account's
+  signNexToken) + `bs:did` = account's derived BsDid, so Photon/NPLN resolve the console to the
+  Reference PID exactly like an emulator. Link flow = the console's `response_type=session_token_code`
+  PKCE sequence (per NeXo-Server's hardware-tested notes): authorize page (Reference e-mail +
+  password -> `/api/login` with X-Admin-Key) -> redirect `?session_token_code=` -> `api/session_token`
+  -> `api/token` -> `/2.0.0/users/me` -> BAAS `/1.0.0/federation` or `/users/<id>/link`.
+  Friends: `/2.0.0/users/<id>/friends` from `/internal/identity`, friend_requests -> internal
+  friend-request/friend-accept, presence PATCH stored locally. **Every unknown request is logged in
+  full (`!! UNHANDLED`)** -- that is how the invitation endpoint (undocumented) will be learned.
+  `podman logs -f legacy-local-nx-baas-1`.
+- `dauth` :18445 (nx-dauth, was profile-gated, now default) -- dauth/aauth/dcert/acert/dragons.
+- Traefik SNI passthrough (`/srv/appdata/traefik/dynamic/legacy.yml` = repo `traefik-rules.yml`;
+  root-owned file was renamed aside, dir is user-writable): BAAS+accounts hosts -> 18447, dauth
+  hosts -> 18445, NPLN tenants unchanged. Verified from the LAN address 10.87.0.2:443.
+- Images: compose now pins `image: localhost/legacy-local-<svc>:latest`; build with
+  `build.sh` (host go build + Containerfile) -- the docker-compose provider does not build
+  `dockerfile_inline` here. zsh gotcha: `$svc:latest` is a `:l` modifier -> use `${svc}:latest`.
+- Website :8081 and dashboard :8093 were already up.
+
+**the third-party setup (`~/REPOS/console patches`, branch `local-legacy`, commit 91a6b7a):** the ↑↓←→ cheat now
+cycles VPS -> Local(AWS) -> **LAN (10.87.0.2)** -> VPS, and the hosts file gains
+`ns.photonengine.io -> server` (Outbound's Photon name server). Built in the devkitpro/devkita64
+container: `/mnt/media/research/outbound/prelude/legacy-lan.nro` (17.8 MB). Photon
+must be reachable on the LAN: earlier-photon binds 0.0.0.0 (5055/5056/27000-27002 UDP).
+
+**Guesses to confirm from the first console logs (all marked `ponytail:` in nx-baas/main.go):**
+friends list envelope `{count, friends}` vs bare array; friend_requests body keys; `/1.0.0/users`
+lookup query keys; whether the console verifies the NA id_token's jku; PKCE verifier ignored.
+
+**Next steps, in order:** (1) copy `legacy-lan.nro` to both consoles, select LAN, boot in
+Reference mode; (2) Settings > Users > Link Nintendo Account on console A -> watch nx-baas log
+through login/federation; fix whatever `!! UNHANDLED` shows; (3) same on console B, then add each
+other as friends (friend code) -- friends list shape check; (4) Outbound: Host Game on A -> Photon
+log shows the console's join with `bsdid:`/`nex:` identity; (5) Invite Friends on A -> the BAAS
+invitation request appears in the nx-baas log = the endpoint to implement; (6) push to B (Penne
+`val.hac.penne` / `god.hac.lp1.penne` are already redirected; unhandled today -> log tells).
+
 ## NEXT SESSION — concrete plan
 
 Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
