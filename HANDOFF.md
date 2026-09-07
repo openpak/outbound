@@ -3826,6 +3826,47 @@ log shows the console's join with `bsdid:`/`nex:` identity; (5) Invite Friends o
 invitation request appears in the nx-baas log = the endpoint to implement; (6) push to B (Penne
 `val.hac.penne` / `god.hac.lp1.penne` are already redirected; unhandled today -> log tells).
 
+## Console link: where it stands (2026-09-07 00:45, end of session)
+
+**Flow = "Restore User"** (Settings > Users > Add User > *Restore*, NOT "create user"; the console
+builds the profile from the server). Link page = e-mail+password OR QR (QR not built locally yet).
+Progress on the LAN stack tonight, each step ground-truthed against a capture of the VPS
+(`/mnt/media/research/outbound/services/vps-baas-login-capture.txt` = real BAAS login +
+user object; `nx-baas-capture-*.log` = NA refresh/token/users/me):
+
+1. Browser CA: the third-party setup installs bundles in BOTH `romfs/browser/` and `romfs/0/browser/` (the
+   latter is what fw 22 reads) + a stale `romfs_metadata.bin` that must be purged. Done (LAN CA).
+2. NA token/users/me shapes now identical to the VPS (scope array, `at_hash`, `ac:grt/ac:scp`,
+   full profile object). Distinct kid per issuer (console binds kid<->issuer). Works: the console
+   proceeds to `POST /1.0.0/users` + `/1.0.0/federation`.
+3. BAAS tokens/user object mirror the captured VPS login (typ JWT headers, `bs:sts`, thumbnails at
+   `cdn-image…/1/<id>`, bare friend code, `nicknameUpdatedAt`, playLog as string, snapshot reply).
+4. **`extras.self.nxAccount` is what Restore User needs**: with it the console showed the
+   "Importing a user: OutboundJo" screen. It is a 174-byte console profile blob (uid[16] + settings;
+   format only partly known, one captured sample is served with a fresh uid via
+   `NX_TEST_NXACCOUNT`, see compose). Proper generation from the account's Mii/avatar = TODO.
+5. After the import OK the console registers push (NPNS): Penne `god/val…penne`, Vermillion `gw…`,
+   Beach `beach.hac.lp1.eshop` — none had a Traefik route (connection dropped -> "could not be
+   linked"). Now routed to nx-baas and answered (`penne.go`). **Untested: the next Restore attempt.**
+
+Errors decoded: 2810-1818/1819 = browser cert trust; 2124-3122 = users/me identity incoherent;
+2124-3121 = BAAS response unparsable (base64 thumbnail / "SW-" friend code); 2124-0292 = Restore
+has nothing to restore (no nxAccount) ; "account already used on this console" = same NA id as an
+existing profile (never map the joiner to the VPS id again).
+
+Accounts: joiner `outbound-joiner@local.test` / `Joiner2026!`, local NA id set to a random
+`dbf92e8d559082bc` (accounts.json edited + container restart). The console's own VPS profile
+(<user-a>, NA `21fde2a5ab9cac6f`) is untouched. nx-baas runs with `NX_DEBUG=1` (full bodies in
+`podman logs legacy-local-nx-baas-1`). Capture mode: `NX_UPSTREAM=51.178.29.194` + Traefik
+service swap (see `restore` of `traefik-rules.yml`); never leave it on -- a link attempt in capture
+mode would create a device account on the VPS.
+
+**Next session:** (1) Restore User on console A -> read the log through Penne/Vermillion; fix
+`!! UNHANDLED`. (2) Build the QR link flow (`/connect/1.0.0/qr/{nouveau,etat,refuse}`, phone page
+`/lier?c=`, 4-digit PIN; page JS contract captured in scratch `vps-authorize.html`, copy in
+`nx-baas` TODO). (3) Generate `nxAccount` properly. (4) Then console B, friends, Outbound host,
+Invite Friends -> the BAAS invitation endpoint appears as `!! UNHANDLED`.
+
 ## NEXT SESSION — concrete plan
 
 Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
