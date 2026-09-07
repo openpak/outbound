@@ -1,6 +1,26 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-09-07 (session 2, ~09:00 UTC). **CONSOLE LINK WORKS ON THE LAN STACK.** OutboundJoiner
+Last updated: 2026-09-07 09:27 UTC. **REAL CONSOLE HOSTS, CITRON JOINS — WORKING END TO END ON THE LAN STACK.**
+Console (OutboundJoiner, Outbound 1.1.7) hosted room Q35V9E on earlier-photon; the invite went joiner -> OutboundHost
+via `/api/invitations`; Citron's injected join entered the room; Fusion host reports players=2 and both see each
+other. Blockers found and fixed this morning, in order:
+1. Console link (see below): per-SNI certs (2123-0013) and `PUT push_channels` `{}` -> full channel object.
+2. Outbound launch spinner: `capi.lp1.op2.nintendo.net/v1/users/<na>/memberships` (NSO membership) and NA
+   `qrcode_param` were unanswered. nx-baas `0808537` serves both like the VPS (active "default" membership).
+3. Photon unreachable from the LAN: ufw (default DROP) only allowed TCP 443. Opened `5055:5058/udp` and
+   `27000:27002/udp` (`pkexec ufw allow ...`). Citron never hit it (loopback).
+4. "A Photon error has occurred": NameServer handed every private-network peer `127.0.0.1:27001`. earlier-photon
+   `94672b1`: loopback peers only; LAN peers get the advertised host (`ns.photonengine.io`, the third-party setup resolves it to
+   the LAN IP).
+5. Citron saw the room but refused it: console Outbound was 1.0.1 (title v2), Citron 1.1.7 (v6 update). Fusion
+   filters sessions by `"version"`. Installed `/mnt/media/Emulation/roms/switch updates/Outbound
+   [0100ED9024EB8800][v393216][Up v6.0.1].nsp` on the console.
+Reverse-direction rig: `TARGET_PID=1800000004 scripts/mint-host-token.sh <file>` then
+`OUTBOUND_HOST_TOKEN_FILE=<file> OUTBOUND_JOINER_PID=1800000003 scripts/send-test-invite.sh <CODE>`; room code
+from `EnterRoom "<CODE>" actor=1` in the Photon log; relaunch Citron before every join (`pkill -f
+"[u]se-nopgo/bin/citron"` -- a bare pkill pattern matches your own shell). Invites expire after 5 min.
+
+**Console link (earlier this session):** OutboundJoiner
 (pid 1800000004) was added to the console via the stock flow (NA login page -> /federation) and is linked and
 working. What actually unblocked it, in order (all in nx-baas, all ground-truthed against the VPS):
 1. `1e7066f`/`e391076` TLS: the per-SNI on-demand cert change served fresh certs for the BAAS names too; the
@@ -25,9 +45,9 @@ journalctl (`CONTAINER_NAME=legacy-local-nx-baas-1`, local time = UTC+1) when a 
 Mirror seeding for <user-a>/leia (accounts 8/9, real ids, empty device password adopted on first login) is in
 place and untested on the console. nx-dauth `615c1a6` logs aauth application ids.
 
-NEXT: (1) console friends list — <user-a>/joiner add each other (joiner friend code SW-8370-7532-3519); (2) host
-Outbound on the console, Invite Friends -> the BAAS invitation endpoint appears as `!! UNHANDLED` in the nx-baas
-log = the spec to implement; (3) test the <user-a>/leia mirror in LAN mode.
+NEXT: (1) gameplay between console and Citron (movement, pickups, vehicles, 30+ min, server RSS); (2) the console's
+own Invite Friends button -> BAAS invitation endpoint shows up as `!! UNHANDLED` in nx-baas = spec to implement;
+(3) <user-a>/leia mirror test in LAN mode; (4) console friends list (joiner friend code SW-8370-7532-3519).
 
 ---
 _Earlier status (2026-09-07 morning, historical):_
