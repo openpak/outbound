@@ -28,11 +28,11 @@ if ! ss -lun 2>/dev/null | grep -q ":27000 "; then   # port check, not pgrep -f 
     echo "starting photon (advertised host ns.photonengine.io)..."
     (cd "$PHOTON_DIR" && \
         DOTNET_ROLL_FORWARD=Major \
-        BLACKICE_Server__Ports__NameServerAlt=27000 \
-        BLACKICE_Server__Ports__MasterServerAlt=27001 \
-        BLACKICE_Server__Ports__GameServerAlt=27002 \
-        BLACKICE_Server__Listener__DeadTimeoutSeconds=600 \
-        nohup dotnet run --project server/BlackIce.Server.Host -- \
+        OPENPAK_Server__Ports__NameServerAlt=27000 \
+        OPENPAK_Server__Ports__MasterServerAlt=27001 \
+        OPENPAK_Server__Ports__GameServerAlt=27002 \
+        OPENPAK_Server__Listener__DeadTimeoutSeconds=600 \
+        nohup dotnet run --project server/OpenPak.Server.Host -- \
             ns.photonengine.io --trace > "$LOG_DIR/photon.log" 2>&1 &)
 else
     echo "photon already running"

@@ -3983,7 +3983,7 @@ Everything on the transport side that has been tested now works: fresh join, ret
 continuity (7+ min), pickups both ways, pre-join state, leave (avatar removed), rejoin (no ghost).
 Candidates, in order of value:
 1. **Longer play session** (30+ min, both players moving, driving, building). Watch for desyncs,
-   `Not handling RPC` storms, memory growth of `BlackIce.Server` (was 495 MB after 12 min of one
+   `Not handling RPC` storms, memory growth of `OpenPak.Server` (was 495 MB after 12 min of one
    room; check `ps -o rss`).
 2. **Host quits while the joiner stays** (master-client migration). `ElectMaster` re-elects the
    lowest actor; the game's reaction to `IsSharedModeMasterClient` flipping is untested.
