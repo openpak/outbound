@@ -1,8 +1,9 @@
 # Outbound Reference — development handoff
 
-**2026-09-07 10:10 — nx-baas MOVED to `~/REPOS/Openpak/nx-baas` (AGPL-3.0).** It is the owner's from-scratch
-Switch server and becomes the OpenPak Switch adapter; `legacy-local/compose.yml` builds it from
-`../Openpak/nx-baas`. Decision: the earlier stack cannot be the base of a competing product (source-available
+**2026-09-07 10:10 — nx-baas is now TWO copies.** `~/REPOS/nx-baas` = frozen clone for the earlier stack (tag
+`frozen-20260907`; `legacy-local/compose.yml` builds from `../nx-baas`; only hotfixes for the running rig go
+here). `~/REPOS/Openpak/nx-baas` = the same history plus LICENSE (AGPL-3.0), evolving into the OpenPak Switch adapter
+on the account core. Decision: the earlier stack cannot be the base of a competing product (source-available
 noncompete); the migration plan (adapter on the OpenPak account core, then dauth, emulator API, console tooling,
 News) is in the OpenPak workspace, where all further work happens with agents. Pending there: Penne frontline
 protocol (console never opens TLS to fro-3 on 443; a tcpdump for the port was started 09:55).
