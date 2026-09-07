@@ -11,7 +11,7 @@
 set -euo pipefail
 
 LOCAL_DIR="${OUTBOUND_STACK_DIR:-$HOME/REPOS/legacy-local}"
-PHOTON_DIR="${OUTBOUND_PHOTON_DIR:-$HOME/REPOS/Openpak/middleware/photon}"
+PHOTON_DIR="${OUTBOUND_PHOTON_DIR:-$HOME/REPOS/Openpak/servers/photon}"
 LOG_DIR="${OUTBOUND_RUN_DIR:-/mnt/media/research/outbound/services}"   # disk-backed, never /tmp (tmpfs)
 mkdir -p "$LOG_DIR"
 
