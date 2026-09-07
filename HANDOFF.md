@@ -104,7 +104,7 @@ _Earlier status (2026-09-06 and before, historical):_
 cancelled receive stays queued in `SocketAsyncContext` until data arrives -- a `dotnet-dump`
 `dumpheap -stat` of the 2.8 GB process showed 6.3 M `BufferMemoryReceiveOperation` + linked CTS
 objects. The loop now keeps ONE receive and ONE timer task pending across iterations. **Verify next
-run: `ps -o rss= -p $(pgrep -f bin/Debug/net8.0/BlackIce.Server.Host)` should stay ~0.3-0.5 GB.**
+run: `ps -o rss= -p $(pgrep -f bin/Debug/net8.0/OpenPak.Server.Host)` should stay ~0.3-0.5 GB.**
 Housekeeping item 5 also done (delay experiment removed; actors leave `Room.ActorNumbers`, so the
 join-response actor list / master hint are truthful for the host-quits and 3-player tests).
 Earlier that night: **FRESH JOIN AND RETURNING JOIN BOTH WORK, REPEATABLY** (rooms
@@ -464,7 +464,7 @@ Outbound), keep per-game config (App ID, title ID, auth requirements)
 data-driven, and keep whatever's genuinely Black-Ice-specific (its PUN
 room/game-mode logic) isolated from the shared transport/auth core.
 
-Status: forked, cloned, builds clean (`dotnet build server/BlackIce.Server.sln`).
+Status: forked, cloned, builds clean (`dotnet build server/OpenPak.Server.sln`).
 `dotnet test` needs `DOTNET_ROLL_FORWARD=LatestMajor` (only .NET 9 runtime is
 installed, project targets .NET 8; installing the matching runtime needs
 `sudo`, not done) — with that env var, all 452 tests pass.
@@ -508,7 +508,7 @@ keeps using its real retail App ID; only the hostname is redirected.
    correctly stay plaintext — no key exists yet at that point.)
 3. **Second NameServer port (`27000`), added.** Outbound's client
    independently tries this port (`ServerPorts.NameServerAlt`, env
-   `BLACKICE_Server__Ports__NameServerAlt=27000`), completely regardless of
+   `OPENPAK_Server__Ports__NameServerAlt=27000`), completely regardless of
    what address `GetRegions` hands back — confirmed by testing every
    combination (same port as NameServer, Master's port, 1 region, 2 regions,
    different region names): **none of it changed the client's behavior on
@@ -593,10 +593,10 @@ and `GameServerAlt`, same pattern as the existing `NameServerAlt` — optional
 second listeners sharing the primary role's handler. Run with all three set
 to get the modern port triplet:
 ```sh
-BLACKICE_Server__Ports__NameServerAlt=27000 \
-BLACKICE_Server__Ports__MasterServerAlt=27001 \
-BLACKICE_Server__Ports__GameServerAlt=27002 \
-dotnet run --project server/BlackIce.Server.Host -- <advertised-host>
+OPENPAK_Server__Ports__NameServerAlt=27000 \
+OPENPAK_Server__Ports__MasterServerAlt=27001 \
+OPENPAK_Server__Ports__GameServerAlt=27002 \
+dotnet run --project server/OpenPak.Server.Host -- <advertised-host>
 ```
 No change needed to what address/port `NameServerHandler` sends back — the
 client ignores the port anyway, only the host matters.
@@ -715,7 +715,7 @@ commands, which the server ignored, leaving the client waiting forever on a
 response that would never come (pure eNet `Ping`/`Ack` keepalive, confirmed
 byte-for-byte via `--trace` — ruling out the alternate theory that the
 client was reacting to a wrong/malformed server answer). Fixed in
-`BlackIce.Photon/Transport/EnetPeer.cs` (`HandleFragment`, reassembly keyed
+`OpenPak.Photon/Transport/EnetPeer.cs` (`HandleFragment`, reassembly keyed
 per-channel by start sequence number). **Got the field layout wrong on the
 first attempt** — assumed a 6-field/24-byte sub-header (adding a redundant
 `fragmentLength` field); the real layout, verified byte-for-byte against the
@@ -742,7 +742,7 @@ own room properties (`scene`, `vehicleType`, `version`, plugin name
 `"FusionPlugin"`, etc.).
 
 **3. `GameServerHandler.EnterRoom` rejected any room name that wasn't a
-pre-configured "realm".** BlackIce's whole room model is fixed, named,
+pre-configured "realm".** OpenPak's whole room model is fixed, named,
 persistent realms (`"Black Ice — Co-op"` etc.) — there's no concept of an
 ad-hoc client-created room. Fusion is the opposite: every "Host Session"
 click creates a brand-new room under a random 6-character code, never a
@@ -796,7 +796,7 @@ bit (`WriteBool`), one byte, or N bytes are packed back-to-back with no
 padding except at the very end. Traced the exact algorithm from
 `BitStream.WriteByteAt`/`InternalReadByte` (LSB-first within each byte,
 multi-byte ints written low-byte-first) and reimplemented it clean-room as
-`BlackIce.Photon/FusionProtocol.cs` (`FusionBitReader`/`FusionBitWriter`) —
+`OpenPak.Photon/FusionProtocol.cs` (`FusionBitReader`/`FusionBitWriter`) —
 **never** by loading or executing the proprietary DLL itself (loading it via
 reflection hit an unrelated native `NanoSockets` dependency chain and was
 abandoned; the bit-packing algorithm is simple enough to reimplement
@@ -880,7 +880,7 @@ token the server gave it minutes earlier). The real server replies within
 ~40ms with a `NetCommandAccepted` (32 bytes: `AcceptedLocalId`=
 `AcceptedRemoteId`={Group=0, GroupIndex=0, Generation=1}, `Counter=1` — a
 self-loopback accept, appropriate for a solo Shared-mode host). Implemented
-as `FusionRelayProtocol` (`BlackIce.Photon`), wired into
+as `FusionRelayProtocol` (`OpenPak.Photon`), wired into
 `GameServerHandler.HandleRaiseEvent`; both directions pinned as regression
 fixtures (`FusionRelayProtocolTests`) against the real captured bytes.
 
@@ -1688,13 +1688,13 @@ only right as a second player is about to be invited, or whether it
 relies solely on the native invite applet's own separate channel).
 
 **Self-inflicted Photon server outage while chasing this:** restarting
-`earlier-photon`'s `BlackIce.Server.Host` to finally capture its trace
+`earlier-photon`'s `OpenPak.Server.Host` to finally capture its trace
 output to a file (previously going to an unread anonymous pipe -- opaque
 this entire project) failed with ".NET 8.0 required, only 9.0.19 found":
 the system's net8.0 shared runtime is gone (likely removed by a routine
 system update since the server was first started, hours earlier in this
 session). Fixed with `DOTNET_ROLL_FORWARD=Major`, restored alongside the
-four `BLACKICE_Server__*` env vars the original launch used
+four `OPENPAK_Server__*` env vars the original launch used
 (`NameServerAlt=27000`, `MasterServerAlt=27001`, `GameServerAlt=27002`,
 `Listener__DeadTimeoutSeconds=600`) -- all six UDP ports (5055/5056/5058
 + the three Alt ports) confirmed listening again. The server was fully
@@ -1855,7 +1855,7 @@ surfaced two housekeeping facts worth keeping for the next restart:
 `openpak-account` listens on `:8080` by default, not `:8099` — it needs
 `PORT=8099` set explicitly to match what citron's `OPENPAK_API` expects.
 `earlier-photon` needs `DOTNET_ROLL_FORWARD=Major` (still only .NET 9 is
-installed) plus the same four `BLACKICE_Server__Ports__{NameServerAlt,
+installed) plus the same four `OPENPAK_Server__Ports__{NameServerAlt,
 MasterServerAlt,GameServerAlt}`/`Listener__DeadTimeoutSeconds` env vars as
 before. Both citron profiles need `OPENPAK_API=http://127.0.0.1:8099` and
 `OPENPAK_PHOTON_IP=127.0.0.1` set on every single launch — neither
@@ -2729,7 +2729,7 @@ none is 1020.)
 That pointed straight at the server, and the cause is a **misconfigured
 dead-peer timeout**:
 
-- `BlackIce.Server.Core` evicts any peer with no *inbound* datagram for
+- `OpenPak.Server.Core` evicts any peer with no *inbound* datagram for
   `Server:Listener:DeadTimeoutSeconds`, which **defaults to 120 s**
   (`ServerOptions.cs`). `UdpListener.RunMaintenance` pings quiet peers, and a
   live client answers (refreshing `LastInboundUtc`) — but while the **Invite
@@ -2737,15 +2737,15 @@ dead-peer timeout**:
   sending and answering pings. At 120 s of silence the server evicts it.
 - `start-services.sh` tried to raise this to 600 s but used
   `Listener__DeadTimeoutSeconds=600` — the config reader only honours the
-  **`BLACKICE_` prefix** and binds `ServerOptions` under `Server`
-  (`ServerConfig.cs`, `.AddEnvironmentVariables(prefix:"BLACKICE_")`), so the
-  correct key is **`BLACKICE_Server__Listener__DeadTimeoutSeconds`**. The
+  **`OPENPAK_` prefix** and binds `ServerOptions` under `Server`
+  (`ServerConfig.cs`, `.AddEnvironmentVariables(prefix:"OPENPAK_")`), so the
+  correct key is **`OPENPAK_Server__Listener__DeadTimeoutSeconds`**. The
   mis-prefixed var was silently dropped and the server ran on the 120 s default —
   which is exactly the observed ~2-4 min solo/after-invite death.
 
 **Fix applied:** `start-services.sh` now sets
-`BLACKICE_Server__Listener__DeadTimeoutSeconds=600` (the port vars were already
-correctly `BLACKICE_Server__Ports__…`). Takes effect on the next earlier-photon
+`OPENPAK_Server__Listener__DeadTimeoutSeconds=600` (the port vars were already
+correctly `OPENPAK_Server__Ports__…`). Takes effect on the next earlier-photon
 restart — the currently-running instance still has the 120 s default. A cleaner
 follow-up (not required for the fix) is to keep a host peer alive across applet
 suspension, e.g. hold its slot while the room has a live registration rather than
@@ -2753,7 +2753,7 @@ evicting purely on inbound silence.
 
 
 **Durable server fix (implemented + unit-tested, `earlier-photon`):** rather
-than rely on a fixed timeout the applet can outlast, `BlackIce.Server.Core`'s
+than rely on a fixed timeout the applet can outlast, `OpenPak.Server.Core`'s
 listener now keys the eviction grace to session stage —
 `UdpListener.EvictionGrace(status)` returns `InRoomDeadTimeoutSeconds`
 (default 1800 s) for `SessionStatus.InRoom` peers and `DeadTimeoutSeconds`
@@ -2761,7 +2761,7 @@ listener now keys the eviction grace to session stage —
 InRoom >= base; `KeepaliveTests.EvictionGrace_gives_in_room_peers_the_longer_timeout`
 covers it (16/16 pass). earlier-photon was restarted so both the 600 s base and
 the in-room grace are live. A host suspended by the Invite Friends applet is no
-longer evicted mid-invite. Also fixed a self-matching `pgrep -f "BlackIce.Server.Host"`
+longer evicted mid-invite. Also fixed a self-matching `pgrep -f "OpenPak.Server.Host"`
 in `start-services.sh` (it matched this shell and skipped the restart); it now
 keys off the :27000 listen port.
 
@@ -2980,9 +2980,9 @@ matching 2.0.x SDK if the live test shows packet-level disagreement.
 The spike graduated into the real server. New, all committed-ready in `earlier-photon`
 (uncommitted at session end — see the list at the very bottom):
 
-- **`BlackIce.Server.Fusion.UnityStub`** — hand-written `UnityEngine.dll` (~500 lines) covering the
+- **`OpenPak.Server.Fusion.UnityStub`** — hand-written `UnityEngine.dll` (~500 lines) covering the
   exact 92 types / 418 members Fusion references. Real math/memory/JSON; inert scene/physics/profiler.
-- **`BlackIce.Server.Fusion`** — hosts Fusion's own `Simulation.Server` (Shared topology) one-per-room
+- **`OpenPak.Server.Fusion`** — hosts Fusion's own `Simulation.Server` (Shared topology) one-per-room
   (`FusionSharedServer`), bridged to clients through `RelaySocket`, an in-process `INetSocket` whose
   datagrams are Photon **event-101** payloads. `FusionServerFactory` isolates all Fusion-internal use
   (Krafs.Publicizer). Thread-affine: each room ticks only on its owning listener thread.
@@ -3036,7 +3036,7 @@ Ran host+joiner live through the new Fusion Shared-mode server (earlier-photon r
    `server/fusion-libs/*.dll` to the Host output.
 2. Copying wasn't enough: `Fusion.Runtime` loads `Photon.Realtime` by NAME at runtime, and .NET only
    trusts assemblies in the app's `deps.json`. Fixed by referencing every Fusion lib EXPLICITLY in
-   `BlackIce.Server.Host.csproj` (under the FUSION_LIBS condition) so they land in deps.json.
+   `OpenPak.Server.Host.csproj` (under the FUSION_LIBS condition) so they land in deps.json.
 3. (Earlier) the UnityStub/publicizer/patch chain — already in place from the build work above.
 
 **The remaining gap — the joiner joins + relays but never fully enters the world.** The server sends only
@@ -3101,7 +3101,7 @@ capture is the input we lack; everything up to it is now built and proven.
 
 Captured a genuine SOLO Outbound×Photon-Cloud session on the Steam client (`pkexec tcpdump` on the
 Photon UDP ports; only one Steam copy, but SOLO is enough — a solo cloud client fully enters the game).
-Decoded it with a new tool `~/photon-oracle/pcapdecode` (references `BlackIce.Photon`: parses SLL2 ->
+Decoded it with a new tool `~/photon-oracle/pcapdecode` (references `OpenPak.Photon`: parses SLL2 ->
 IP/UDP -> Photon datagram -> `NCommand` -> `WireMessage`). Artifacts on the pool (never committed):
 `/mnt/media/research/outbound/REFERENCE-cloud-solo-223853.pcap` and `...-decoded.txt`.
 
@@ -3174,7 +3174,7 @@ The root-cause fix worked. Rebuilt `server/fusion-libs/` from **Fusion 2.0.8** (
 2.0.8.1402 — downloaded to `~/Downloads/photon-fusion-2.0.8-stable-1402`, staged at `~/photon-oracle/v208`).
 Changes required for 2.0.8 vs 2.1.2 (all done, server builds + runs):
 - 2.0.8 references **Photon3Unity3D.dll** (classic Realtime v4), not PhotonClient/Photon.Realtime. No
-  Photon.Realtime source build needed. Updated `BlackIce.Server.Fusion.csproj` + Host csproj refs.
+  Photon.Realtime source build needed. Updated `OpenPak.Server.Fusion.csproj` + Host csproj refs.
 - **No PluginVersion patch** for 2.0.8 (that concept is 2.1.x-only) — use Fusion.Runtime.dll UNPATCHED.
 - `Simulation.ICallbacks` differs: rewrote `NoopCallbacks` (adds `OnMessage`->SimulationMessageResult,
   `OnReliableData(PlayerRef,ReliableId,bool,byte[])`, `ObjectChanged`, `RemoteObjectCreated`,
@@ -3287,7 +3287,7 @@ game" — different time-of-day, can't see each other). Diagnosed end-to-end fro
 Recommendation: do (2) FIRST (one capture settles whether the server must parse or just relay), then
 either register serializers (1) or switch to opaque relay. Do NOT keep guessing at the parser.
 
-**Memory leak (fix before any long soak):** over the night's cumulative runs one `BlackIce.Server`
+**Memory leak (fix before any long soak):** over the night's cumulative runs one `OpenPak.Server`
 process reached **14.4 GB** RSS and drove the 29 GB machine to 1 GB free, which OOM-wedged both
 citrons (host could only make one aborted NameServer connect → "spinning wheel"). A freshly started
 server is ~0.3 GB and a single 7-min session stayed ~0.3 GB, so the leak is gradual/cumulative
@@ -3361,7 +3361,7 @@ between long runs still applies).
 
 Five host+join rounds this morning (rooms E4A9PE, SLQG9E, TKFJGE, 4BJSXE, DCTKKE), each one
 exposing the next wall in the hosted `Simulation.Server`. All fixes are in earlier-photon
-`server/BlackIce.Server.Fusion/` (uncommitted at time of writing), in order:
+`server/OpenPak.Server.Fusion/` (uncommitted at time of writing), in order:
 
 1. **NRE in `ReadObjectUpdates`** (section above) — synthetic `SimulationConnection` for
    `PlayerRef.None` + `RemoteObjectCreated → Replicator.OnObjectSpawnedLocal`.
@@ -3396,7 +3396,7 @@ per-object SA/ChangedTick, per-connection Status/TickSent/TickAcknowledged). Rea
 next time something "isn't showing".
 
 **Operational lessons today:**
-- Kill the server by PID, never `pkill -f BlackIce.Server.Host` from a Bash tool call (the pattern
+- Kill the server by PID, never `pkill -f OpenPak.Server.Host` from a Bash tool call (the pattern
   matches the calling shell — took the tool call down with it once).
 - A citron that outlives its server WILL crash with "Uncaught C++ exception" on the next manufactured
   Join (`legacy_guest_call` fires into a runner with stale state). Relaunch both citrons after
@@ -3476,7 +3476,7 @@ silence grace by design (a Switch sleeping / applet on screen must not drop a re
 short `DeadTimeout=600` only applies pre-room. Eviction DOES dispose: `RunMaintenance` →
 `peer.NotifyDisconnect()` → `handler.OnDisconnect` → `LeaveRoom` → `_fusion.PlayerLeft` → RoomSim
 disposed. Killed clients just linger up to 30 min. For faster test cleanup set
-`BLACKICE_Server__Listener__InRoomDeadTimeoutSeconds=60`.
+`OPENPAK_Server__Listener__InRoomDeadTimeoutSeconds=60`.
 
 **THE ACTUAL GAMEPLAY ROOT CAUSE — `knownPlayers`.** Confirmed by diffing the ONE working session
 (DCTKKE) against every failing one:
@@ -3626,7 +3626,7 @@ sequence had holes (F7, FD, 00, 03, 06). Raw eNet trace: those were `Cmd(15) fla
 (`PhotonClient.dll` decompile: `RemoveSentReliableCommand(seq, channel, isUnsequenced = ackType==16)`)
 never matched the ack, retransmitted (same seq 1/2 three times in 100 ms), and hit its reliable timeout →
 `DisconnectCause.ClientTimeout` → `ShutdownReason.PhotonCloudTimeout` (=14) → Outbound shows 1000+14.
-(Earlier codes fit the same table: 1001 = Error, 1020 = OperationTimeout.) Fix (`BlackIce.Photon`):
+(Earlier codes fit the same table: 1001 = Error, 1020 = OperationTimeout.) Fix (`OpenPak.Photon`):
 types 14/15 handled like 6/8 (identical headers, verified from the client decompile), ack type 16 when the
 acked command has `FlagUnsequenced`, fragment reassembly keyed by `(channel, startSeq)` so interleaved
 retransmits don't clobber each other. Test: `SendFragmentUnsequenced_reassembles_interleaved_groups_and_acks_with_type16`.
@@ -3720,7 +3720,7 @@ pursued.
 or Fusion's native socket threads ignore it), the process keeps the ports, and `start-services.sh`
 then silently skips the start (this bit us four times today). The script SIGKILLs the port owner,
 archives the log under the tag, starts fresh, verifies. `InRoomDeadTimeoutSeconds` must be ≥
-`DeadTimeoutSeconds` (600 in the rig) — pass `BLACKICE_Server__Listener__InRoomDeadTimeoutSeconds=600`
+`DeadTimeoutSeconds` (600 in the rig) — pass `OPENPAK_Server__Listener__InRoomDeadTimeoutSeconds=600`
 to clear ghost rooms in 10 min instead of 30. Kill other processes logged in as the joiner account
 (a leftover Ryujinx joiner ate invitations). Relaunch the joiner citron for every join. The
 `FUSION_SETPLAYEROBJECT_DELAY_TICKS` experiment env is still in the code (default 0 = off); remove it

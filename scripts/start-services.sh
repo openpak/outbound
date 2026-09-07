@@ -32,6 +32,7 @@ if ! ss -lun 2>/dev/null | grep -q ":27000 "; then   # port check, not pgrep -f 
         OPENPAK_Server__Ports__MasterServerAlt=27001 \
         OPENPAK_Server__Ports__GameServerAlt=27002 \
         OPENPAK_Server__Listener__DeadTimeoutSeconds=600 \
+        OPENPAK_TITLE_ID=0100ED9024EB8000 \
         nohup dotnet run --project server/OpenPak.Server.Host -- \
             ns.photonengine.io --trace > "$LOG_DIR/photon.log" 2>&1 &)
 else
