@@ -1,3 +1,3 @@
-module github.com/ExternalReference/outbound
+module openpak/outbound
 
 go 1.23.0

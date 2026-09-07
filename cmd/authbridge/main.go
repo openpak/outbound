@@ -53,7 +53,7 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	identity := r.Form.Get("identity")
 	if identity == "" {
-		identity = "legacy-test-user"
+		identity = "openpak-test-user"
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(authResponse{

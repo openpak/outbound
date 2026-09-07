@@ -23,7 +23,7 @@ func main() {
 	romfs := flag.String("romfs", "", "path to a dumped RomFS tree (Citron: Dump RomFS)")
 	old := flag.String("old", "", "retail Photon App ID to replace")
 	new_ := flag.String("new", "", "test Photon App ID to substitute")
-	out := flag.String("out", "", "output mod romfs root, e.g. .../load/<TitleID>/legacy-test-app/romfs")
+	out := flag.String("out", "", "output mod romfs root, e.g. .../load/<TitleID>/openpak-test-app/romfs")
 	flag.Parse()
 
 	if *romfs == "" || *old == "" || *new_ == "" || *out == "" {

@@ -7,7 +7,7 @@
 #        setsid nohup scripts/auto-invite.sh > /dev/null 2>&1 < /dev/null &   (detached)
 set -uo pipefail
 LOG_DIR="${OUTBOUND_RUN_DIR:-/mnt/media/research/outbound/services}"
-PHOTON_LOG="$LOG_DIR/earlier-photon.log"
+PHOTON_LOG="$LOG_DIR/photon.log"
 HERE="$(dirname "$(readlink -f "$0")")"
 SENT=""   # space-separated codes already invited (reset when the log is replaced)
 INODE=""

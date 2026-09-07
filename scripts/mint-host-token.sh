@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mints a OpenPak session token for a LOCAL dev account against the legacy-local
+# Mints an account session token for a LOCAL dev account against the local container
 # stack (the account container on :8099) and writes a profile's openpak_account.txt.
 #
 # Why this exists: the dev accounts' passwords aren't recorded anywhere. The account
@@ -13,7 +13,7 @@
 # This touches ONLY local dev accounts on the LOCAL stack. Never commit the output.
 set -euo pipefail
 
-LOCAL_DIR="$HOME/REPOS/legacy-local"
+LOCAL_DIR="${OUTBOUND_STACK_DIR:-$HOME/REPOS/legacy-local}"
 ENV_FILE="$LOCAL_DIR/.env"
 ACCOUNTS_FILE="$LOCAL_DIR/data/account/accounts.json"
 OUT_FILE="${1:-$HOME/.local/share/citron/host/user/config/openpak_account.txt}"

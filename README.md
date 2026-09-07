@@ -1,7 +1,9 @@
-# Outbound — Reference Photon compatibility service
+# Outbound — OpenPak Photon compatibility service
 
-Research and implementation workspace for adding **Outbound** online support to
-earlier network.
+Research and test rig for **Outbound** online support in the OpenPak stack. The
+server it drives is [`photon`](../photon) (BlackIce.Server); the account side is
+whatever container stack `scripts/start-services.sh` is pointed at
+(`OUTBOUND_STACK_DIR`, still legacy-local until OpenPak has its own compose).
 
 Outbound does not use Nintendo NEX for its multiplayer transport. Live testing
 confirmed that it uses Photon Realtime/Fusion: the client connects to Photon’s
@@ -25,8 +27,8 @@ authentication. The existing provider rejects Citron’s replacement BAAS token.
 Superseded research below; the live state is in [`HANDOFF.md`](HANDOFF.md).
 In short: Photon Cloud's built-in `NintendoSwitch` auth provider can never
 accept a replacement token, so the project runs Outbound against the
-self-hosted [`earlier-photon`](../earlier-photon) server (citron redirect
-`OPENPAK_PHOTON_IP`) plus the `legacy-local` account stack. That server
+self-hosted [`photon`](../photon) server (citron redirect
+`OPENPAK_PHOTON_IP`) plus the local account stack. That server
 hosts Fusion's own Shared-mode `Simulation.Server` per room (headless, from
 the game's exact Fusion 2.0.8 build). As of 2026-09-06 two citron players
 share one world: fresh and returning joins, leaving (avatar removed) and
@@ -50,4 +52,8 @@ data, copyrighted game material or production infrastructure.
    proof of concept demonstrates that the game’s room/event logic works.
 
 See [`docs/research.md`](docs/research.md) for the evidence log.
+
+## License
+
+AGPL-3.0-only — see `LICENSE`.
 

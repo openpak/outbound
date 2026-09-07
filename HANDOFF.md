@@ -1,3 +1,7 @@
+> Ported to OpenPak on 2026-09-07: this repo is `~/REPOS/Openpak/servers/outbound` (AGPL-3.0-only) and the
+> server is `../photon`. `~/REPOS/earlier-outbound` is the frozen pre-port copy; everything below
+> this line predates the port and still says "legacy" in places.
+
 # Outbound Reference — development handoff
 
 **2026-09-07 10:10 — nx-baas is now TWO copies.** `~/REPOS/nx-baas` = frozen clone for the earlier stack (tag

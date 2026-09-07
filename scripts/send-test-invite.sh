@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sends a synthetic friend invitation to the JOINER dev account directly through the
-# local openpak-account API -- the documented on-demand trigger (see outbound-re
+# local account API -- the documented on-demand trigger (see outbound-re
 # NOTES.md): reliable for testing without needing the host's live GUI/MyPage flow.
 #
 # The application parameter is Outbound's real, live-captured invite format
