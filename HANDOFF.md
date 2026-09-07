@@ -1,5 +1,12 @@
 # Outbound Reference — development handoff
 
+**2026-09-07 10:10 — nx-baas MOVED to `~/REPOS/Openpak/nx-baas` (AGPL-3.0).** It is the owner's from-scratch
+Switch server and becomes the OpenPak Switch adapter; `legacy-local/compose.yml` builds it from
+`../Openpak/nx-baas`. Decision: the earlier stack cannot be the base of a competing product (source-available
+noncompete); the migration plan (adapter on the OpenPak account core, then dauth, emulator API, console tooling,
+News) is in the OpenPak workspace, where all further work happens with agents. Pending there: Penne frontline
+protocol (console never opens TLS to fro-3 on 443; a tcpdump for the port was started 09:55).
+
 Last updated: 2026-09-07 09:27 UTC. **REAL CONSOLE HOSTS, CITRON JOINS — WORKING END TO END ON THE LAN STACK.**
 Console (OutboundJoiner, Outbound 1.1.7) hosted room Q35V9E on earlier-photon; the invite went joiner -> OutboundHost
 via `/api/invitations`; Citron's injected join entered the room; Fusion host reports players=2 and both see each
