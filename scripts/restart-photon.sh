@@ -4,6 +4,9 @@
 # wait for the port, archive the log under a tag, start fresh. Extra env (OPENPAK_*, FUSION_*)
 # passes through to the server.
 #
+# Note: the kill matches the CURRENT process name (OpenPak.Server.Host). A server left running
+# from before the OpenPak rename shows up as BlackIce.Server.Host and must be killed by hand.
+#
 # Usage: scripts/restart-photon.sh [archive-tag]     e.g. scripts/restart-photon.sh preinternal-DTS8AE
 set -uo pipefail
 LOG_DIR="${OUTBOUND_RUN_DIR:-/mnt/media/research/outbound/services}"
@@ -18,7 +21,7 @@ ss -lun | grep -q ':27000 ' && { echo "port 27000 still bound; aborting" >&2; ex
 
 [ -f "$LOG_DIR/photon.log" ] && mv "$LOG_DIR/photon.log" "$LOG_DIR/photon-$(date +%m%d)-$TAG.log"
 setsid nohup "$HERE/start-services.sh" > "$LOG_DIR/start-services.out" 2>&1 < /dev/null &
-for _ in $(seq 1 30); do ss -lun | grep -q ':27000 ' && break; sleep 1; done
+for _ in $(seq 1 90); do ss -lun | grep -q ":27000 " && break; sleep 1; done
 sleep 2
 if ss -lun | grep -q ':27000 ' && [ -f "$LOG_DIR/photon.log" ]; then
     echo "photon up: pids $(pgrep -f 'bin/Debug/net8.0/OpenPak.Server.Host' | tr '\n' ' '), log $LOG_DIR/photon.log"

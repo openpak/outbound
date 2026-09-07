@@ -42,7 +42,7 @@ fi
 echo
 echo "logs: $LOG_DIR/"
 echo "waiting for ports..."
-for i in $(seq 1 30); do
+for i in $(seq 1 90); do
     ok=1
     ss -lun 2>/dev/null | grep -q ":27000 " || ok=0
     ss -ltn 2>/dev/null | grep -q ":8099 " || ok=0
