@@ -3953,7 +3953,7 @@ Errors decoded: 2810-1818/1819 = browser cert trust; 2124-3122 = users/me identi
 has nothing to restore (no nxAccount) ; "account already used on this console" = same NA id as an
 existing profile (never map the joiner to the VPS id again).
 
-Accounts: joiner `outbound-joiner@local.test` / `Joiner2026!`, local NA id set to a random
+Accounts: joiner `outbound-joiner@local.test` / `<password in the local stack's .env, not recorded here>`, local NA id set to a random
 `dbf92e8d559082bc` (accounts.json edited + container restart). The console's own VPS profile
 (<user-a>, NA `21fde2a5ab9cac6f`) is untouched. nx-baas runs with `NX_DEBUG=1` (full bodies in
 `podman logs legacy-local-nx-baas-1`). Capture mode: `NX_UPSTREAM=51.178.29.194` + Traefik
