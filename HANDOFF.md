@@ -1,5 +1,5 @@
 > Ported to OpenPak on 2026-09-07: this repo is `~/REPOS/Openpak/servers/outbound` (AGPL-3.0-only) and the
-> server is `../photon`. `~/REPOS/earlier-outbound` is the frozen pre-port copy; everything below
+> server is `../../middleware/photon`. `~/REPOS/earlier-outbound` is the frozen pre-port copy; everything below
 > this line predates the port and still says "legacy" in places.
 
 # Outbound Reference — development handoff
