@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sends a synthetic friend invitation to the JOINER dev account directly through the
-# local account API -- the documented on-demand trigger (see outbound-re
+# Sends a synthetic friend invitation to the JOINER dev account directly through
+# nx-baas's invitation mailbox -- the documented on-demand trigger (see outbound-re
 # NOTES.md): reliable for testing without needing the host's live GUI/MyPage flow.
 #
 # The application parameter is Outbound's real, live-captured invite format
@@ -10,7 +10,7 @@
 # Usage: scripts/send-test-invite.sh <ROOMCODE>
 # Env:   OUTBOUND_HOST_TOKEN_FILE (default: host profile's dev openpak_account.txt)
 #        OUTBOUND_JOINER_PID      (default: 1800000004 = OutboundJoiner)
-#        OUTBOUND_ACCOUNT_API     (default: http://127.0.0.1:8099)
+#        OUTBOUND_BAAS_API        (default: http://127.0.0.1:20070, nx-baas game API)
 set -euo pipefail
 
 CODE="${1:?usage: $0 <ROOMCODE> (e.g. CNRXJE -- the room code shown on the host)}"
@@ -18,7 +18,7 @@ CODE="${1:?usage: $0 <ROOMCODE> (e.g. CNRXJE -- the room code shown on the host)
 
 TOKEN_FILE="${OUTBOUND_HOST_TOKEN_FILE:-$HOME/.local/share/citron/host/user/config/openpak_account.txt}"
 JOINER_PID="${OUTBOUND_JOINER_PID:-1800000004}"
-API="${OUTBOUND_ACCOUNT_API:-http://127.0.0.1:8099}"
+API="${OUTBOUND_BAAS_API:-http://127.0.0.1:20070}"
 
 [[ -f "$TOKEN_FILE" ]] || { echo "no host account file: $TOKEN_FILE" >&2; exit 1; }
 TOKEN=$(sed -n 's/^token=//p' "$TOKEN_FILE")

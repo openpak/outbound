@@ -1,8 +1,29 @@
 > Ported to OpenPak on 2026-09-07: this repo is `~/REPOS/Openpak/servers/outbound` (AGPL-3.0-only) and the
 > server is `../photon`. `~/REPOS/earlier-outbound` is the frozen pre-port copy; everything below
 > this line predates the port and still says "legacy" in places.
-
 # Outbound Reference — development handoff
+
+**2026-09-07 — outbound + photon now talk to nx-baas, not openpak-account.** Room presence and the
+invitation mailbox moved onto the Switch adapter's own game API (plain HTTP, `NX_API_ADDR`, default
+`:20070` per OpenPak `ports.md`). What changed:
+- `nx-baas/gameapi.go` (new): `POST /internal/photon-room` `{identity,room,app_id}` — the adapter
+  resolves `nex:`/`bsdid:` itself (it is the account authority), so photon's old resolve+publish pair
+  is one call; `GET/POST /api/invitations` — the same wire shapes citron already speaks, so the
+  emulator needs no rebuild, only `OPENPAK_API`; `POST /internal/mint-token` `{pid}` — a bearer for
+  any PID the backend knows, replacing the offline HMAC over `legacy-local/.env`. Bearers are the
+  existing `nx2.` openpak token, which openpak-account also accepts. Unhandled `/api/*` is forwarded to
+  `ACCOUNT_API` until the OpenPak core serves friends/presence/saves itself.
+- photon `AccountRoomPublisher`: one POST to `OPENPAK_BAAS_URL` (deliberately a new variable — a rig
+  still setting `OPENPAK_ACCOUNT_URL` stops publishing rather than posting this shape at the account
+  server). `OPENPAK_INTERNAL_KEY` still names the internal key.
+- scripts: `mint-host-token.sh` curls `/internal/mint-token`; `send-test-invite.sh` and the citron
+  launchers point at `OUTBOUND_BAAS_API` (default `http://127.0.0.1:20070`), the launchers also
+  exporting it as `OPENPAK_API` so the joiner polls the mailbox that now receives the invite.
+
+**One wiring step is NOT done:** `legacy-local/compose.yml` still builds nx-baas from the frozen
+`../nx-baas` and publishes no :20070. Until it builds `../Openpak/nx-baas` with that port published,
+photon publishes nothing and the scripts have nothing to talk to. Left alone on purpose — the frozen
+copy is what keeps the proven Reference rig stable (2026-09-07 decision).
 
 **2026-09-07 10:10 — nx-baas is now TWO copies.** `~/REPOS/nx-baas` = frozen clone for the earlier stack (tag
 `frozen-20260907`; `legacy-local/compose.yml` builds from `../nx-baas`; only hotfixes for the running rig go
@@ -3961,8 +3982,8 @@ service swap (see `restore` of `traefik-rules.yml`); never leave it on -- a link
 mode would create a device account on the VPS.
 
 **Next session:** (1) Restore User on console A -> read the log through Penne/Vermillion; fix
-`!! UNHANDLED`. (2) Build the QR link flow (`/connect/1.0.0/qr/{nouveau,etat,refuse}`, phone page
-`/lier?c=`, 4-digit PIN; page JS contract captured in scratch `vps-authorize.html`, copy in
+`!! UNHANDLED`. (2) Build the QR link flow (`/connect/1.0.0/qr/{new,state,deny}`, phone page
+`/link?c=`, 4-digit PIN; page JS contract captured in scratch `vps-authorize.html`, copy in
 `nx-baas` TODO). (3) Generate `nxAccount` properly. (4) Then console B, friends, Outbound host,
 Invite Friends -> the BAAS invitation endpoint appears as `!! UNHANDLED`.
 

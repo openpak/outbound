@@ -2,10 +2,10 @@
 # Starts the two local services Outbound multiplayer testing needs, if they are not
 # already running. Idempotent -- safe to run before every test session.
 #
-# The account server is still the legacy-local container stack (account published
-# on :8099) -- OpenPak has no local compose stack of its own yet; point
-# OUTBOUND_STACK_DIR at one when it exists. Profile tokens are minted against that
-# stack's secret (mint-host-token.sh). The photon server needs
+# The stack is still the legacy-local container set -- OpenPak has no local compose of
+# its own yet; point OUTBOUND_STACK_DIR at one when it exists. Room presence and
+# invitations go to nx-baas's game API (:20070); it must be built from
+# ../Openpak/nx-baas and publish that port, or photon simply won't publish rooms. The photon server needs
 # DOTNET_ROLL_FORWARD=Major (only .NET 9 installed) and the client-hardcoded modern
 # port triplet (27000/27001/27002).
 set -euo pipefail
@@ -33,6 +33,8 @@ if ! ss -lun 2>/dev/null | grep -q ":27000 "; then   # port check, not pgrep -f 
         OPENPAK_Server__Ports__GameServerAlt=27002 \
         OPENPAK_Server__Listener__DeadTimeoutSeconds=600 \
         OPENPAK_TITLE_ID=0100ED9024EB8000 \
+        OPENPAK_BAAS_URL="${OUTBOUND_BAAS_API:-http://127.0.0.1:20070}" \
+        OPENPAK_INTERNAL_KEY="${NX_INTERNAL_KEY:-}" \
         nohup dotnet run --project server/OpenPak.Server.Host -- \
             ns.photonengine.io --trace > "$LOG_DIR/photon.log" 2>&1 &)
 else
@@ -46,11 +48,13 @@ for i in $(seq 1 90); do
     ok=1
     ss -lun 2>/dev/null | grep -q ":27000 " || ok=0
     ss -ltn 2>/dev/null | grep -q ":8099 " || ok=0
+    ss -ltn 2>/dev/null | grep -q ":20070 " || ok=0
     [ "$ok" = 1 ] && break
     sleep 1
 done
 if [ "$ok" = 1 ]; then
-    echo "ready: account :8099 (tcp), photon :27000/udp (+ 5055/5056/5058/27001/27002)"
+    echo "ready: account :8099, nx-baas game API :20070, photon :27000/udp (+ 5055/5056/5058/27001/27002)"
 else
     echo "warning: ports not confirmed yet -- check $LOG_DIR/ before testing" >&2
+    ss -ltn 2>/dev/null | grep -q ":20070 " || echo "  (:20070 missing -- is nx-baas built from ../Openpak/nx-baas with the port published?)" >&2
 fi
