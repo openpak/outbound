@@ -1,25 +1,33 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-09-07 (session 2). **CONSOLE-LINK MIRROR BUILT — ready for the first LAN-mode console test.**
-<user-a> + leia are now seeded in the LAN stack so a console in LAN mode should refresh straight into the full
-linked object (no 2124-3121, no re-linking):
-- `legacy-local/data/account/accounts.json`: accounts 8 (<user-a>, pid 1800000008) and 9 (leia, pid 1800000009)
-  with the REAL na_id / baas_id / friend code and bs_did = the console token's `bs:did` (336eca0db668530f /
-  5d4ca016f4563994); friends of each other; email `<name>@legacy.local`, password `legacy-lan-2026`.
-- `legacy-local/data/nx-baas/baas.json`: users keyed by the real baas ids (ae575806b0efa797 / 1118f9d65503d233),
-  device accounts 6656e0bbf2927116 / 2e5eb62979c7100f with an EMPTY password; `naToPid` filled.
-- nx-baas `8ed31bc`: `store.Login` adopts the presented password when the seeded device has an empty one (test in
-  `store_test.go`). Rebuilt (`podman build -f - ../nx-baas` with the compose inline Dockerfile — `podman compose build`
-  chokes on `dockerfile_inline`) and running; account restarted.
-- VERIFIED by a simulated `/1.0.0/login` for the <user-a> device: response mirrors the VPS capture (id, NA link,
-  friend code, nickname, constant blob). The test-adopted password was reset to empty afterwards, so the console's
-  first real login is what binds it. Backups: `accounts.json.bak-20260907`, `baas.json.bak-20260907`.
-- Committed: the third-party setup `bc57d54` (LAN-reset fix), nx-baas `cdbf276` (fixed cert in capture mode) + `8ed31bc`.
+Last updated: 2026-09-07 (session 2, ~09:00 UTC). **CONSOLE LINK WORKS ON THE LAN STACK.** OutboundJoiner
+(pid 1800000004) was added to the console via the stock flow (NA login page -> /federation) and is linked and
+working. What actually unblocked it, in order (all in nx-baas, all ground-truthed against the VPS):
+1. `1e7066f`/`e391076` TLS: the per-SNI on-demand cert change served fresh certs for the BAAS names too; the
+   console rejected them (2123-0013 = SSL). Fixed cert for every SAN it covers; random serials (same-second mints
+   shared a serial). On-demand certs only for unrouted SNI (logged).
+2. `bf9168c` **PUT /1.0.0/push_channels must return the full channel object** (userId, deviceAccountId, service,
+   deviceToken, deviceAttributes, userAttributes, createdAt, updatedAt). We returned `{}` and the console showed
+   "The Nintendo Account could not be linked because an error occurred" right after that request, every time.
+   Also: id_token `nintendo` block is APPLICATION style (ai/at/av/edi/tbh/tbn, from appAuthNToken when sent, else
+   ai=0100f8f0000a2000 av=0033); unlinked users get `/1/default` + `/2/default` thumbnails (default.jpg in
+   `legacy-local/data/nx-baas/`).
+3. `329a754`/blob: nxAccount is served from the user's stored blob only. The 174-byte blob is a constant on the
+   VPS login path too (the VPS's GET /users/{id} serves a second template) — it is NOT per-account identity.
+   Restore without a blob -> 2124-0292. Joiner/<user-a>/leia records carry the constant.
+4. `a39a7ea` etag == bs:did for linked users (VPS parity; probably not load-bearing).
+**How the ground truth was obtained (reusable):** the VPS BAAS is reachable with SNI
+(`curl --resolve <host>:443:51.178.29.194`). A throwaway device account (dauth -> application/token ->
+POST /users -> /login -> PUT push_channels -> GET /users/{id}) captured every reply shape without touching a
+real profile. Probe output: scratch `vps-probe.json` (not archived — rerun the chain if needed; one orphan
+device account per run, harmless). Also: nx-baas debug lines can lag in `podman logs` by a minute; use
+journalctl (`CONTAINER_NAME=legacy-local-nx-baas-1`, local time = UTC+1) when a request seems missing.
+Mirror seeding for <user-a>/leia (accounts 8/9, real ids, empty device password adopted on first login) is in
+place and untested on the console. nx-dauth `615c1a6` logs aauth application ids.
 
-NEXT: put the console in LAN mode (the third-party setup v3.4.0 NRO), open <user-a> and leia — both should show linked with the
-right friend codes; they are already friends server-side. Then host Outbound on one and try the invite path. If a
-device password is rejected: check that the device id the console presents matches the seeded one (nx-baas DBG log),
-and that `baas.json` still has `"password": ""` for it (a stray login adopts the first password it sees).
+NEXT: (1) console friends list — <user-a>/joiner add each other (joiner friend code SW-8370-7532-3519); (2) host
+Outbound on the console, Invite Friends -> the BAAS invitation endpoint appears as `!! UNHANDLED` in the nx-baas
+log = the spec to implement; (3) test the <user-a>/leia mirror in LAN mode.
 
 ---
 _Earlier status (2026-09-07 morning, historical):_
@@ -3928,15 +3936,10 @@ Invite Friends -> the BAAS invitation endpoint appears as `!! UNHANDLED`.
 
 ## NEXT SESSION — concrete plan
 
-**PRIORITY: first console test in LAN mode against the seeded mirror** (built 2026-09-07, see top of file).
-1. Console -> the third-party setup LAN mode -> open <user-a>, then leia. Expect: linked, friend codes 8741-1421-3742 /
-   8279-5926-7788, each already in the other's friend list.
-2. Host Outbound on one, Invite Friends -> the BAAS invitation endpoint will show up as `!! UNHANDLED` in the
-   nx-baas DBG log; that dump is the spec for implementing it.
-3. If login fails with invalid_device_account: nx-baas log shows the device id presented; compare with
-   `baas.json` (seeded ids 6656e0bbf2927116 / 2e5eb62979c7100f, password must be "" before first login).
-(The mirror steps that were planned here are DONE: accounts 8/9 seeded, baas users seeded, store.Login adopt
-tweak committed, simulated login verified.)
+**Console link DONE (2026-09-07 09:00): OutboundJoiner linked on the console via the stock flow.** See the top of
+the file for what fixed it (push_channels object, TLS certs). Next: friends between console profiles, then host
+Outbound on the console and Invite Friends -> implement whatever shows up as `!! UNHANDLED` in the nx-baas log.
+Then the <user-a>/leia mirror test in LAN mode (seeded, untested).
 
 ---
 Transport/gameplay rig (all working, historical). Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
