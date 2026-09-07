@@ -1,6 +1,65 @@
 # Outbound Reference — development handoff
 
-Last updated: 2026-09-06 (late night). **SERVER MEMORY LEAK FIXED** (earlier-photon `1311ba5`): the
+Last updated: 2026-09-07 (session 2). **CONSOLE-LINK MIRROR BUILT — ready for the first LAN-mode console test.**
+<user-a> + leia are now seeded in the LAN stack so a console in LAN mode should refresh straight into the full
+linked object (no 2124-3121, no re-linking):
+- `legacy-local/data/account/accounts.json`: accounts 8 (<user-a>, pid 1800000008) and 9 (leia, pid 1800000009)
+  with the REAL na_id / baas_id / friend code and bs_did = the console token's `bs:did` (336eca0db668530f /
+  5d4ca016f4563994); friends of each other; email `<name>@legacy.local`, password `legacy-lan-2026`.
+- `legacy-local/data/nx-baas/baas.json`: users keyed by the real baas ids (ae575806b0efa797 / 1118f9d65503d233),
+  device accounts 6656e0bbf2927116 / 2e5eb62979c7100f with an EMPTY password; `naToPid` filled.
+- nx-baas `8ed31bc`: `store.Login` adopts the presented password when the seeded device has an empty one (test in
+  `store_test.go`). Rebuilt (`podman build -f - ../nx-baas` with the compose inline Dockerfile — `podman compose build`
+  chokes on `dockerfile_inline`) and running; account restarted.
+- VERIFIED by a simulated `/1.0.0/login` for the <user-a> device: response mirrors the VPS capture (id, NA link,
+  friend code, nickname, constant blob). The test-adopted password was reset to empty afterwards, so the console's
+  first real login is what binds it. Backups: `accounts.json.bak-20260907`, `baas.json.bak-20260907`.
+- Committed: the third-party setup `bc57d54` (LAN-reset fix), nx-baas `cdbf276` (fixed cert in capture mode) + `8ed31bc`.
+
+NEXT: put the console in LAN mode (the third-party setup v3.4.0 NRO), open <user-a> and leia — both should show linked with the
+right friend codes; they are already friends server-side. Then host Outbound on one and try the invite path. If a
+device password is rejected: check that the device id the console presents matches the seeded one (nx-baas DBG log),
+and that `baas.json` still has `"password": ""` for it (a stray login adopts the first password it sees).
+
+---
+_Earlier status (2026-09-07 morning, historical):_
+
+A selective full-forward VPS capture (only nx-baas's TLS made fixed-cert again; NX_UPSTREAM
+forwards everything to the VPS) got BOTH org accounts to refresh SILENTLY, and both returned a
+byte-IDENTICAL 174-byte nxAccount blob — identical to what we already serve via `NX_TEST_NXACCOUNT`. So the
+blob is NOT per-account and was never the blocker; the "generate the blob" and "Restore User" tracks are dead
+ends (Restore also needs a console-side backup record of the profile uid, which a new account never has — see
+`## Console link` sections). Per-account identity is the ordinary fields — NA id, friend code, device account
+id, nickname, baas id. Captured for both accounts:
+`/mnt/media/research/outbound/services/{login-<user-a>.json,login-leia.json,console-account-map.txt}`.
+- <user-a>: baasId=ae575806b0efa797 device=6656e0bbf2927116 NA=21fde2a5ab9cac6f fc=8741-1421-3742
+- leia:    baasId=1118f9d65503d233 device=2e5eb62979c7100f NA=45d1c6f774bcfdee fc=8279-5926-7788
+
+**Capture must be SELECTIVE-friendly:** global `NX_UPSTREAM` full-forward works for the blob ONLY if nx-baas
+serves the FIXED multi-SAN cert (my on-demand per-SNI cert change disturbed the console's silent NA session and
+forced interactive re-login -> account check fails -> no blob). nx-baas now uses the fixed cert whenever
+`NX_UPSTREAM` is set (`main.go`, capture-mode branch). NEVER leave capture on. dauth stays on local nx-dauth;
+the console reused its cached VPS device token, so BAAS `/login` (proxied to VPS) accepted it.
+
+**the third-party setup rebased to upstream v3.4.0** (`console patches` branch `local-legacy`, 6 LAN commits replayed clean;
+backup tag `backup/local-legacy-prerebase-20260907`). Brings SSBU 1.4.1, the BCAT CDN redirect, version-from-
+APP_VERSION. Built NRO: `/mnt/media/research/outbound/prelude/legacy-lan.nro` (v3.4.0). Also FIXED a
+latent LAN bug: picking the plain "Reference" row re-applied `g_server_ip`, which startup detection had left at
+the LAN IP, so "back to Reference" stayed LAN. `legacy_apply_legacy()` now resets a leftover LAN IP to the
+VPS default. UNCOMMITTED: the the third-party setup fix + the nx-baas fixed-cert-in-capture change (rebuild/redeploy done, git
+not committed).
+
+**NEXT SESSION = build the MIRROR** (see `## NEXT SESSION` at end and the memory note
+`console-link-restore-deadend`): seed <user-a>+<user-b> into `openpak-account/data/account/accounts.json` (real NA
+id, friend code, nickname, a PID) and `nx-baas/data/nx-baas/baas.json` (real baas id + PID bound to the console
+device id; pre-seeded device must adopt its password on first login — store.Login TOFU adopts UNKNOWN device
+ids today, add an empty-password=adopt tweak). Then a console in LAN mode refreshes and gets the full linked
+object (no 2124-3121), no re-linking. The rest below (transport/gameplay) is historical, all working.
+
+---
+_Earlier status (2026-09-06 and before, historical):_
+
+**SERVER MEMORY LEAK FIXED** (earlier-photon `1311ba5`): the
 `UdpListener` loop cancelled its `ReceiveAsync` every tick (16 ms with a hosted sim) and on Linux a
 cancelled receive stays queued in `SocketAsyncContext` until data arrives -- a `dotnet-dump`
 `dumpheap -stat` of the 2.8 GB process showed 6.3 M `BufferMemoryReceiveOperation` + linked CTS
@@ -3869,7 +3928,18 @@ Invite Friends -> the BAAS invitation endpoint appears as `!! UNHANDLED`.
 
 ## NEXT SESSION — concrete plan
 
-Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
+**PRIORITY: first console test in LAN mode against the seeded mirror** (built 2026-09-07, see top of file).
+1. Console -> the third-party setup LAN mode -> open <user-a>, then leia. Expect: linked, friend codes 8741-1421-3742 /
+   8279-5926-7788, each already in the other's friend list.
+2. Host Outbound on one, Invite Friends -> the BAAS invitation endpoint will show up as `!! UNHANDLED` in the
+   nx-baas DBG log; that dump is the spec for implementing it.
+3. If login fails with invalid_device_account: nx-baas log shows the device id presented; compare with
+   `baas.json` (seeded ids 6656e0bbf2927116 / 2e5eb62979c7100f, password must be "" before first login).
+(The mirror steps that were planned here are DONE: accounts 8/9 seeded, baas users seeded, store.Login adopt
+tweak committed, simulated login verified.)
+
+---
+Transport/gameplay rig (all working, historical). Rig: `scripts/start-services.sh` (or `restart-photon.sh <tag>` after a server change), then
 `launch-citron-host.sh` / `launch-citron-joiner.sh`, host a session, `send-test-invite.sh <CODE>`
 (code from `EnterRoom "<CODE>" actor=1`), accept on the joiner. Relaunch the joiner citron for every
 join. One behaviour change per round; ask what the user sees before changing anything.
