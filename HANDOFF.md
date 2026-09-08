@@ -1,6 +1,31 @@
 > Ported to OpenPak on 2026-09-07: this repo is `~/REPOS/Openpak/servers/outbound` (AGPL-3.0-only) and the
 > server is `../photon`. `~/REPOS/earlier-outbound` is the frozen pre-port copy; everything below
 > this line predates the port and still says "legacy" in places.
+
+## 2026-09-08 — where the console link stands
+
+The account link is the live thread, not gameplay. `nx-baas` v0.7.0 is deployed; the flow
+completes server-side (federation, login, image_upload, dragons, penne all answer) and the
+console's verdict is pending an owner test.
+
+Two console errors were worked today and both are written up properly in
+[`docs/switch/s2-console-link-2026-09-08.md`](../../docs/switch/s2-console-link-2026-09-08.md) —
+read that before touching the link path. The short version: `2124-3121` and `2124-5104` carry no
+field name and no console-side log, so the only method that works is checking whether any
+request arrived at all, and then diffing the whole reply against one a console accepted.
+`nx-baas/testdata/accepted-login-shape.json` now holds that shape and a test drives the real
+login endpoint against it.
+
+Also live since the port: health endpoints on every service (`ports.md`), a status page on a
+machine that is not the production box, a Flutter companion app, and six-digit link codes with
+a guess cap. The flow itself is documented in
+[`docs/switch/console-link-flow.md`](../../docs/switch/console-link-flow.md).
+
+Photon gained `/health` and `/players` on 8080 — its listeners are UDP and cannot be probed, so
+nothing outside the process could previously tell a running server from a silent one. Its image
+is still built by hand (Fusion assemblies are not redistributable); `podman build --platform
+linux/arm64` here, then push, then `podman auto-update` on the box.
+
 # Outbound Reference — development handoff
 
 **2026-09-07 — outbound + photon now talk to nx-baas, not openpak-account.** Room presence and the
