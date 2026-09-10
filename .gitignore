@@ -6,3 +6,6 @@
 /local/
 *.tgz
 
+
+# Symlink to the workspace-wide docs; only meaningful in the Openpak checkout.
+shared-docs
