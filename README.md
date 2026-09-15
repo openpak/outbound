@@ -24,7 +24,7 @@ authentication. The existing provider rejects Citron’s replacement BAAS token.
 
 ## Status
 
-Superseded research below; the live state is in [`HANDOFF.md`](HANDOFF.md).
+Superseded research below; the live state is in [`HANDOFF.md`](next-session.md).
 In short: Photon Cloud's built-in `NintendoSwitch` auth provider can never
 accept a replacement token, so the project runs Outbound against the
 self-hosted [`photon`](../photon) server (citron redirect
