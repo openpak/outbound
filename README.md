@@ -34,9 +34,10 @@ the game's exact Fusion 2.0.8 build). As of 2026-09-06 two citron players
 share one world: fresh and returning joins, leaving (avatar removed) and
 rejoining, pickups both ways and pre-join world state all work (see the dated sections
 at the end of `HANDOFF.md`; `restart-photon.sh` restarts the server reliably).
-Testing scripts live in `scripts/` (start with `start-services.sh`, then the
-two `launch-citron-*.sh` wrappers; `auto-invite.sh` sends the joiner an invite
-for every room the host opens). We must not commit tokens, keys, account
+Testing scripts live in `scripts/` (start with `start-services.sh`;
+`auto-invite.sh` sends the joiner an invite for every room the host opens).
+The two players are two machines — the persona launch wrappers were retired
+2026-09-26. We must not commit tokens, keys, account
 data, copyrighted game material or production infrastructure.
 
 ## Initial workflow
