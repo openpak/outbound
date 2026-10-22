@@ -124,6 +124,6 @@ items now live in `HANDOFF.md`'s latest dated section.
 - Record where every constant came from.
 - Redact account/session tokens and personal identifiers from logs and fixtures.
 - Do not commit production secrets, certificates, Nintendo code/data or assets.
-- Never send Reference or Nintendo credentials to a newly created third-party app.
+- Never send OpenPak or Nintendo credentials to a newly created third-party app.
 - Keep inferred values clearly marked until independently confirmed.
 

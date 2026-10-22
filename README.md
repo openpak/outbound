@@ -44,7 +44,7 @@ data, copyrighted game material or production infrastructure.
 
 1. Decode only the non-secret fields of Outbound’s Photon Authenticate request.
 2. Create a test Photon application isolated from the retail application.
-3. Implement a small Go authentication endpoint that maps a valid Reference
+3. Implement a small Go authentication endpoint that maps a valid OpenPak
    identity to a stable Photon user ID.
 4. Redirect or runtime-patch Outbound to the test App ID.
 5. Verify Name Server → Master Server → Game Server transitions.

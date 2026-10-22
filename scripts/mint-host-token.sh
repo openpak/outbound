@@ -3,7 +3,7 @@
 # openpak_account.txt.
 #
 # Why this exists: the dev accounts' passwords aren't recorded anywhere. nx-baas's
-# /internal/mint-token signs the same "openpak" token a real login would produce, for any PID
+# /internal/mint-token signs the same account token a real login would produce, for any PID
 # its account backend knows -- so no password and no reading the stack's secret. It is an
 # internal endpoint on an internal port; guard it with NX_INTERNAL_KEY on anything but a
 # private LAN.

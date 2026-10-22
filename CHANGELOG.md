@@ -3,7 +3,7 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
-Note: the early history below is the upstream project (the pre-port earlier project);
+Note: the early history below is the upstream project (the pre-port project);
 OpenPak work starts at the port/fork commit.
 
 ## History — no releases tagged yet
@@ -19,13 +19,12 @@ OpenPak work starts at the port/fork commit.
 - Layout: photon back under Openpak/servers [7aa7838]
 - Layout: photon lives at Openpak/middleware/photon [cc0a8bd]
 - OpenPak port: AGPL-3.0, openpak/outbound module, rig points at servers/photon [869ac8e]
-- docs: frozen nx-baas clone for the earlier stack; OpenPak copy evolves [29d2ae8]
 - docs: nx-baas moved to Openpak (AGPL); OpenPak migration decision [b78545c]
 - docs: real console hosts, Citron joins -- working end to end; ufw UDP, NameServer LAN handoff, NSO membership, game version [411b599]
 - docs: console link works on the LAN stack -- push_channels object + TLS cert fixes; VPS probe recipe [a962d76]
 - docs: console-link mirror built and verified (<user-a>+<user-b> seeded in account + nx-baas); first LAN console test is next [b10cd0e]
 - docs: console link -- Restore User flow ground-truthed against VPS captures; nxAccount blob, Penne/Vermillion/Beach routing; error-code map [49001ea]
-- docs: console rig -- nx-baas (BAAS + Nintendo Account) built and deployed, dauth on, Traefik SNI routes, the third-party setup LAN option; first-console test plan [8849a8e]
+- docs: console rig -- nx-baas (BAAS + Nintendo Account) built and deployed, dauth on, Traefik SNI routes; first-console test plan [8849a8e]
 - docs: hardware invite path corrected -- Outbound has no NPLN; friends sysmodule -> BAAS, endpoint undocumented; milestone plan [e220b0a]
 - docs: server memory leak root-caused and fixed (cancelled UDP receives queue up); housekeeping done [a2c41a1]
 - docs: real-hardware path -- invite is NPLN Messaging (gRPC stream, not NPNS), and the game's invite-consume dead wire; server scope + sources [74b91d5]
