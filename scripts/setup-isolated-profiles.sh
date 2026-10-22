@@ -2,13 +2,13 @@
 # Builds two FULLY ISOLATED citron profiles for Outbound multiplayer testing, using
 # citron's Linux portable mode (a `user/` directory in the launch cwd takes over ALL
 # of citron's storage -- config, saves, keys, NAND, cache -- instead of
-# ~/.config/citron + ~/.local/share/citron; see earlier-citron
+# ~/.config/citron + ~/.local/share/citron; see the earlier Citron build
 # src/common/fs/path_util.cpp, PORTABLE_DIR="user").
 #
 # Isolation guarantees:
 #  - host and joiner cannot see each other's config/saves/keys/NAND
 #  - neither touches the main citron profile (~/.config/citron, ~/.local/share/citron),
-#    so normal citron usage and any other *-legacy testing are unaffected
+#    so normal citron usage and any other testing are unaffected
 #  - qt-config.ini is patched so the persisted OpenPak server/NAT IPs point at
 #    127.0.0.1 (the joiner source profile had REAL PRODUCTION IPs persisted -- a bare
 #    relaunch without env vars would have reached production)
@@ -114,7 +114,7 @@ for role in host joiner; do
     echo "built $dst ($(du -sh "$dst" | cut -f1))"
 done
 
-# 7. Account logins -- both minted against the legacy-local stack (see mint-host-token.sh).
+# 7. Account logins -- both minted against the earlier local stack (see mint-host-token.sh).
 mint="$HOME/REPOS/earlier-outbound/scripts/mint-host-token.sh"
 if [ "${1:-}" != "--keep-tokens" ] || [ ! -f "$HOST_DIR/user/config/openpak_account.txt" ]; then
     "$mint" "$HOST_DIR/user/config/openpak_account.txt"
