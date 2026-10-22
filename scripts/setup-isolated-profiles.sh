@@ -12,7 +12,7 @@
 #  - qt-config.ini is patched so the persisted OpenPak server/NAT IPs point at
 #    127.0.0.1 (the joiner source profile had REAL PRODUCTION IPs persisted -- a bare
 #    relaunch without env vars would have reached production)
-#  - NO LayeredFS mods are copied (the old legacy-test-app App ID override is
+#  - NO LayeredFS mods are copied (the old test-app App ID override is
 #    obsolete with the self-hosted Photon server and would corrupt App-ID tracking)
 #  - the joiner's own log lives inside its own profile (user/log/)
 #
@@ -98,7 +98,7 @@ for role in host joiner; do
     #    bare relaunch with no env vars can never reach the real production servers.
     sed -i 's|^openpak_server_ip=.*|openpak_server_ip=127.0.0.1|' "$dst/config/qt-config.ini"
     sed -i 's|^openpak_nat_ip=.*|openpak_nat_ip=127.0.0.1|' "$dst/config/qt-config.ini"
-    sed -i 's|^enable_legacy=.*|enable_legacy=true|' "$dst/config/qt-config.ini"
+    sed -i 's|^enable_openpak=.*|enable_openpak=true|' "$dst/config/qt-config.ini"
     # Source profiles often carry ABSOLUTE storage-path overrides (nand_directory/
     # sdmc_directory/external_content_dirs from the old XDG layouts) and sometimes a
     # leftover use_gdbstub=true (halts the game at boot waiting for a GDB client).
@@ -107,15 +107,15 @@ for role in host joiner; do
     sed -i "s|^sdmc_directory=.*|sdmc_directory=$dst/sdmc|" "$dst/config/qt-config.ini"
     sed -i 's|^use_gdbstub=.*|use_gdbstub=false|' "$dst/config/qt-config.ini"
     sed -i "s|^Paths\\\\external_content_dirs\\\\1\\\\path=.*|Paths\\\\external_content_dirs\\\\1\\\\path=$dst/sdmc/citron/content|" "$dst/config/qt-config.ini"
-    if ! grep -q "^enable_legacy=true$" "$dst/config/qt-config.ini"; then
-        echo "error: enable_legacy not found/set in $dst/config/qt-config.ini" >&2
+    if ! grep -q "^enable_openpak=true$" "$dst/config/qt-config.ini"; then
+        echo "error: enable_openpak not found/set in $dst/config/qt-config.ini" >&2
         exit 1
     fi
     echo "built $dst ($(du -sh "$dst" | cut -f1))"
 done
 
 # 7. Account logins -- both minted against the earlier local stack (see mint-host-token.sh).
-mint="$HOME/REPOS/earlier-outbound/scripts/mint-host-token.sh"
+mint="$HOME/REPOS/outbound/scripts/mint-host-token.sh"
 if [ "${1:-}" != "--keep-tokens" ] || [ ! -f "$HOST_DIR/user/config/openpak_account.txt" ]; then
     "$mint" "$HOST_DIR/user/config/openpak_account.txt"
 fi
