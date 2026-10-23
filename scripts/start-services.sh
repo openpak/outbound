@@ -2,7 +2,7 @@
 # Starts the two local services Outbound multiplayer testing needs, if they are not
 # already running. Idempotent -- safe to run before every test session.
 #
-# The stack is still the legacy-local container set -- OpenPak has no local compose of
+# The stack is still the local container set -- OpenPak has no local compose of
 # its own yet; point OUTBOUND_STACK_DIR at one when it exists. Room presence and
 # invitations go to nx-baas's game API (:20070); it must be built from
 # ../Openpak/nx-baas and publish that port, or photon simply won't publish rooms. The photon server needs
@@ -10,8 +10,8 @@
 # port triplet (27000/27001/27002).
 set -euo pipefail
 
-LOCAL_DIR="${OUTBOUND_STACK_DIR:-$HOME/REPOS/legacy-local}"
-PHOTON_DIR="${OUTBOUND_PHOTON_DIR:-$HOME/REPOS/Openpak/servers/photon}"
+LOCAL_DIR="${OUTBOUND_STACK_DIR:-$HOME/REPOS/openpak-local}"
+PHOTON_DIR="${OUTBOUND_PHOTON_DIR:-$HOME/REPOS/Openpak/platforms/switch/games/photon}"
 LOG_DIR="${OUTBOUND_RUN_DIR:-/mnt/media/research/outbound/services}"   # disk-backed, never /tmp (tmpfs)
 mkdir -p "$LOG_DIR"
 
