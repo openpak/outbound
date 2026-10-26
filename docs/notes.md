@@ -14,7 +14,7 @@ Former README title: Outbound — OpenPak Photon compatibility service
 
 ## Status
 
-Superseded research below; the live state is in [`HANDOFF.md`](../next-session.md).
+Superseded research below; the live state is in the maintainers' private notes.
 In short: Photon Cloud's built-in `NintendoSwitch` auth provider can never
 accept a replacement token, so the project runs Outbound against the
 self-hosted [`photon`](../../photon) server (redirected by
