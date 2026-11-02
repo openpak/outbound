@@ -4,7 +4,7 @@ Former README title: Outbound — OpenPak Photon compatibility service
 
 ## Client notice (former README header)
 
-> **Current Switch client (2026-10-13): Harbor**, at
+> **Current Switch client: Harbor**, at
 > `~/REPOS/Openpak/emulators/harbor`. Harbor is an independent
 > OpenPak project based on Eden. Citron, Ryujinx (desktop and Android), and
 > the former OpenPak Eden checkouts have been removed. References to those
@@ -12,22 +12,17 @@ Former README title: Outbound — OpenPak Photon compatibility service
 > reinstall them, or select them for current work. Use Harbor's README and
 > current handoff for builds and testing; old results do not establish Harbor parity.
 
-## Status
+## Architecture
 
-Superseded research below; the live state is in the maintainers' private notes.
-In short: Photon Cloud's built-in `NintendoSwitch` auth provider can never
-accept a replacement token, so the project runs Outbound against the
+Photon Cloud's built-in `NintendoSwitch` auth provider can never
+accept a replacement token, so Outbound runs against the
 self-hosted [`photon`](../../photon) server (redirected by
 the emulator's DNS override) plus the local account stack. That server
 hosts Fusion's own Shared-mode `Simulation.Server` per room (headless, from
-the game's exact Fusion 2.0.8 build). As of 2026-09-06 two citron players
-share one world: fresh and returning joins, leaving (avatar removed) and
-rejoining, pickups both ways and pre-join world state all work (see the dated sections
-at the end of `HANDOFF.md`; `restart-photon.sh` restarts the server reliably).
+the game's exact Fusion 2.0.8 build).
 Testing scripts live in `scripts/` (start with `start-services.sh`;
 `auto-invite.sh` sends the joiner an invite for every room the host opens).
-The two players are two machines — the persona launch wrappers were retired
-2026-09-26. We must not commit tokens, keys, account
+Two players are two machines. We must not commit tokens, keys, account
 data, copyrighted game material or production infrastructure.
 
 ## Initial workflow
