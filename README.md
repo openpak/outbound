@@ -29,10 +29,10 @@ OpenPak's Outbound Server.
 ## Docs
 
 - [Protocol](docs/protocol.md)
-- [Evidence](docs/evidence.md)
 - [Deploy](docs/deploy.md)
-- [Notes](docs/notes.md)
 - [Research](docs/research.md)
+
+PRDs: openpak/prds (private)
 
 Live compatibility status: [openpak.org/titles#t-1](https://openpak.org/titles#t-1).
 
