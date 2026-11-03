@@ -14,6 +14,9 @@ of truth; this file is the readable summary.
 Note: the early history below is the upstream project (the pre-port project);
 OpenPak work starts at the port/fork commit.
 
+## v0.1.0 — 2026-11-03
+- Per-request logging: one slog line per HTTP request (method, path, status, ms) on stderr via internal/httplog. Query strings, headers and bodies are never logged; /healthz and /metrics are skipped.
+
 ## History — no releases tagged yet
 
 - Go 1.26, the house version [cfaaab9]

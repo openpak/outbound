@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"openpak/outbound/internal/httplog"
 	"os"
 	"sort"
 	"strings"
@@ -70,5 +71,5 @@ func main() {
 	}
 	http.HandleFunc("/auth", handleAuth)
 	log.Printf("authbridge listening on %s (proof-of-concept, no real verification)", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	log.Fatal(http.ListenAndServe(addr, httplog.Middleware(http.DefaultServeMux)))
 }
