@@ -14,6 +14,12 @@ of truth; this file is the readable summary.
 Note: the early history below is the upstream project (the pre-port project);
 OpenPak work starts at the port/fork commit.
 
+## v0.2.0 - 2026-11-04
+
+**Account erasure endpoint (openpak/prds#120), a no-op.** `authbridge` serves `DELETE /internal/accounts/{account_id}/data`
+(`Authorization: Bearer $ACCOUNT_ERASE_KEY`, unset: 503) and answers `{"service":"outbound","rows":0}`. The bridge accepts
+every Photon custom-auth request and stores nothing (no database, no files, no per-player maps; it logs parameter names only).
+
 ## v0.1.0 — 2026-11-03
 - Per-request logging: one slog line per HTTP request (method, path, status, ms) on stderr via internal/httplog. Query strings, headers and bodies are never logged; /healthz and /metrics are skipped.
 

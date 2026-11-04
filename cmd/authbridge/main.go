@@ -70,6 +70,7 @@ func main() {
 		addr = ":8081"
 	}
 	http.HandleFunc("/auth", handleAuth)
+	http.HandleFunc("DELETE /internal/accounts/{account_id}/data", eraseHandler("outbound"))
 	log.Printf("authbridge listening on %s (proof-of-concept, no real verification)", addr)
 	log.Fatal(http.ListenAndServe(addr, httplog.Middleware(http.DefaultServeMux)))
 }

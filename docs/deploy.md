@@ -15,3 +15,8 @@ room (headless, from the game's exact Fusion 2.0.8 build).
 Testing scripts live in `scripts/`: `start-services.sh`, and `auto-invite.sh`, which sends the
 joiner an invite for every room the host opens. Two players are two machines. Never commit
 tokens, keys, account data, copyrighted game material or production infrastructure.
+
+## Account erasure
+
+`authbridge` serves `DELETE /internal/accounts/{account_id}/data` (`Authorization: Bearer $ACCOUNT_ERASE_KEY`, unset:
+503). The bridge keeps no state, so it is a logged no-op returning `{"service":"outbound","rows":0}`.
